@@ -39,7 +39,7 @@ pub mod terminal_helper;
 pub mod terminal_service;
 cfg_if::cfg_if! {
 if #[cfg(not(target_os = "ios"))] {
-mod clipboard_service;
+pub mod clipboard_service;
 #[cfg(target_os = "android")]
 pub use clipboard_service::is_clipboard_service_ok;
 #[cfg(target_os = "linux")]
@@ -71,7 +71,7 @@ mod login_failure_check;
 pub mod display_service;
 #[cfg(windows)]
 pub mod portable_service;
-mod service;
+pub mod service;
 mod video_qos;
 pub mod video_service;
 

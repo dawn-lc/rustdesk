@@ -259,6 +259,28 @@ pub fn new(source: VideoSource, idx: usize) -> GenericService {
 }
 
 // Capturer object is expensive, avoiding to create it frequently.
+/// SOS / 外部注入：自定义捕获器工厂。
+/// 可动态设置/清除，UAC 时使用 SOS SHMEM，无 UAC 时使用默认 DXGI/GDI。
+static CUSTOM_CAPTURER_FACTORY: std::sync::Mutex<
+    Option<Box<dyn Fn(usize, Display, bool) -> ResultType<Box<dyn TraitCapturer>> + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+pub fn set_custom_capturer_factory(
+    factory: Box<
+        dyn Fn(usize, Display, bool) -> ResultType<Box<dyn TraitCapturer>> + Send + Sync,
+    >,
+) {
+    *CUSTOM_CAPTURER_FACTORY.lock().unwrap() = Some(factory);
+}
+
+pub fn clear_custom_capturer_factory() {
+    *CUSTOM_CAPTURER_FACTORY.lock().unwrap() = None;
+}
+
+pub fn custom_capturer_factory_is_set() -> bool {
+    CUSTOM_CAPTURER_FACTORY.lock().unwrap().is_some()
+}
+
 fn create_capturer(
     privacy_mode_id: i32,
     display: Display,
@@ -292,6 +314,15 @@ fn create_capturer(
         None => {
             #[cfg(windows)]
             {
+                // SOS 注入点：若设置了自定义工厂，用它创建捕获器
+                if let Some(factory) = CUSTOM_CAPTURER_FACTORY.lock().unwrap().as_ref() {
+                    log::info!(
+                        "[create_capturer] Using CUSTOM_CAPTURER_FACTORY (SOS) current={} portable_service_running={}",
+                        _current, _portable_service_running
+                    );
+                    return factory(_current, display, _portable_service_running);
+                }
+
                 log::debug!("Create capturer dxgi|gdi");
                 return crate::portable_service::client::create_capturer(
                     _current,
@@ -705,7 +736,13 @@ fn run(vs: VideoService) -> ResultType<()> {
         {
             if crate::platform::windows::desktop_changed()
                 && !crate::portable_service::client::running()
+                && CUSTOM_CAPTURER_FACTORY.lock().unwrap().is_none()
             {
+                log::info!(
+                    "[run] Desktop changed, bail SWITCH (portable_service_running={} gdi={})",
+                    crate::portable_service::client::running(),
+                    c.is_gdi()
+                );
                 bail!("Desktop changed");
             }
         }

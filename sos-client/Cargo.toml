@@ -1,0 +1,100 @@
+[package]
+name = "rustdesk-sos"
+version = "0.1.0"
+edition = "2021"
+authors = ["RustDesk"]
+description = "RustDesk SOS 精简受控端 - 单文件远程协助客户端"
+
+[[bin]]
+name = "rustdesk-sos"
+path = "src/main.rs"
+
+[dependencies]
+# 核心公共库
+hbb_common = { path = "../libs/hbb_common" }
+
+# 屏幕捕获（仅 Windows DXGI + GDI）
+scrap = { path = "../libs/scrap", default-features = false }
+
+# 输入注入
+enigo = { path = "../libs/enigo" }
+
+# Windows 注册表
+winreg = "0.52"
+
+# 音频捕获与编码
+cpal = "0.15"
+opus = "0.3"
+
+# 剪贴板操作
+clipboard = { path = "../libs/clipboard" }
+
+# Windows API
+windows = { version = "0.58", features = [
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# 共享内存（便携服务 IPC）
+shared_memory = "0.12"
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 命令行解析
+clap = { version = "4.5", features = ["derive"] }
+
+# 日志
+env_logger = "0.11"
+
+# 上游完整服务框架
+rustdesk = { path = ".." }
+
+log = "0.4"
+
+# 工具
+anyhow = "1.0"
+hex = "0.4"
+serde = "1.0"
+serde_json = "1.0"
+rand = "0.8"
+
+# 锁定兼容 Rust 1.75 的依赖版本
+home = "=0.5.9"
+
+[build-dependencies]
+protobuf-codegen = "3.7"
+cc = "1.0"
+winres = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+    "winuser",
+    "shellapi",
+    "securitybaseapi",
+    "wtsapi32",
+    "processthreadsapi",
+    "handleapi",
+    "synchapi",
+    "psapi",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
