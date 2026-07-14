@@ -8,6 +8,8 @@ extern "C" {
 }
 
 use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use scrap::{Capturer, Frame, TraitCapturer, TraitPixelBuffer};
 use crate::sos_shmem::{
     SosShmem,
@@ -15,8 +17,9 @@ use crate::sos_shmem::{
     SHMEM_ADDR_CAPTURE_FRAME_COUNTER, SHMEM_ADDR_CAPTURE_FRAME,
 };
 
-/// GDI 捕获写 SHMEM（主线程阻塞）。
-pub fn run(shmem_name: &str) {
+/// GDI 捕获写 SHMEM（由 SYSTEM 子进程捕获线程调用）。
+/// 通过 `active` 标志实现按需启停：仅 UAC 安全桌面时主进程发信号启动。
+pub fn run(shmem_name: &str, active: Arc<AtomicBool>) {
     const ADDR_FRAME: usize = SHMEM_ADDR_CAPTURE_FRAME;
 
     log::info!("[CAP] Opening SHMEM: {}", shmem_name);
@@ -48,11 +51,33 @@ pub fn run(shmem_name: &str) {
     };
 
     let mut first = true;
+    let mut paused_logged = false;
     let mut cap_err_count = 0u32;
     let mut frame_count = 0u64;
     let mut last_heartbeat = std::time::Instant::now();
 
     loop {
+        // 等待主进程的捕获启动信号（UAC 安全桌面激活时）
+        if !active.load(Ordering::Relaxed) {
+            if !paused_logged {
+                log::info!("[CAP] Capture paused, waiting for UAC signal...");
+                paused_logged = true;
+            }
+            // 重置状态，确保下次启动时重新输出 "First frame written"
+            first = true;
+            frame_count = 0;
+            cap_err_count = 0;
+            last_heartbeat = std::time::Instant::now();
+            // park 而非 sleep：控制线程收到 START 信号时会 unpark，实现零延迟唤醒
+            // timeout 500ms 为安全兜底（极端情况 unpark 丢失时不会永久阻塞）
+            std::thread::park_timeout(Duration::from_millis(500));
+            continue;
+        }
+        paused_logged = false;
+        // 仅在捕获恢复时输出日志（first 在暂停时被重置为 true）
+        if first {
+            log::info!("[CAP] Capture started, writing frames to SHMEM...");
+        }
         match capturer.frame(Duration::from_millis(33)) {
             Ok(frame) => {
                 if let Frame::PixelBuffer(pixels) = frame {

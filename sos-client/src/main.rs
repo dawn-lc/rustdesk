@@ -19,13 +19,13 @@ mod sos_capture;
 mod sos_config;
 mod sos_connection;
 mod sos_constants;
+mod sos_file_transfer;
 mod sos_input;
 mod sos_pipe;
 mod sos_rendezvous;
 mod sos_shmem;
 mod sos_system;
 mod sos_tray;
-mod sos_file_transfer;
 
 use clap::Parser;
 use hbb_common::ResultType;
@@ -34,7 +34,10 @@ use std::sync::mpsc;
 
 /// RustDesk SOS 精简受控端
 #[derive(Parser)]
-#[command(name = "rustdesk-sos", about = "RustDesk SOS 精简受控端 - 单文件远程协助客户端")]
+#[command(
+    name = "rustdesk-sos",
+    about = "RustDesk SOS 精简受控端 - 单文件远程协助客户端"
+)]
 struct Cli {
     /// 显示控制台窗口并输出调试日志
     #[arg(long, default_value_t = false)]
@@ -66,7 +69,10 @@ async fn main() -> ResultType<()> {
     // 捕获所有 panic，输出到 stderr 防止静默崩溃
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
         let payload = info.payload();
         let msg = if let Some(s) = payload.downcast_ref::<&str>() {
             *s
@@ -87,9 +93,9 @@ async fn main() -> ResultType<()> {
     // CreateFile("CONOUT$") 打开控制台并用 SetStdHandle 重定向。
     #[cfg(windows)]
     if cli.debug && !cli.service {
-        use windows::Win32::System::Console::*;
-        use windows::Win32::Storage::FileSystem::*;
         use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::*;
+        use windows::Win32::System::Console::*;
         unsafe {
             let has_parent = AttachConsole(ATTACH_PARENT_PROCESS).is_ok();
             if !has_parent {
@@ -119,11 +125,11 @@ async fn main() -> ResultType<()> {
         let _ = std::io::stderr().flush();
     }
 
+    let log_level = if cli.debug { "info" } else { "warn" };
     // 初始化日志（所有模式都需要）
     if cli.service {
-        sos_bootstrap::init_system_logger("info");
+        sos_bootstrap::init_system_logger(log_level);
     } else {
-        let log_level = if cli.debug { "info" } else { "warn" };
         sos_bootstrap::init_logger(log_level);
     }
 
@@ -139,10 +145,11 @@ async fn main() -> ResultType<()> {
         sos_bootstrap::show_admin_required_and_exit();
     }
 
-    // 1. 初始化日志（--debug 时显示 info 级及以上，否则只显示 warn/error）
-    let log_level = if cli.debug { "info" } else { "warn" };
-    sos_bootstrap::init_logger(log_level);
-    log::info!("{} v{} starting...", sos_constants::APP_NAME, env!("CARGO_PKG_VERSION"));
+    log::info!(
+        "{} v{} starting...",
+        sos_constants::APP_NAME,
+        env!("CARGO_PKG_VERSION")
+    );
 
     // 1a. 输出主进程令牌诊断
     #[cfg(windows)]
@@ -160,6 +167,11 @@ async fn main() -> ResultType<()> {
     log::info!("Device ID: {}", config.id);
     log::info!("Rendezvous server: {}", config.rendezvous_server);
 
+    // 种子 CPU 使用率初始值，防止 codec_thread_num 因 PDH 计数器未就绪
+    // 而回退到 1 线程。后台 PDH 线程就绪后会自动用真实数据覆盖。
+    #[cfg(windows)]
+    hbb_common::platform::windows::sync_cpu_usage(Some(50.0));
+
     // 密码策略：
     //   --password 传入 → 永久固定，不保存注册表，不断开刷新
     //   未传入       → 自动生成临时密码，每次连接断开后刷新
@@ -173,7 +185,10 @@ async fn main() -> ResultType<()> {
     if cli_password_provided {
         log::info!("Using fixed CLI password (not regenerated on disconnect)");
     } else {
-        log::info!("Temporary password (will refresh each connection): {}", temp_pwd);
+        log::info!(
+            "Temporary password (will refresh each connection): {}",
+            temp_pwd
+        );
     }
 
     // 4. 创建 SOS 自有 SHMEM（固定名 "sos"，SYSTEM 子进程常驻写帧）
@@ -186,8 +201,18 @@ async fn main() -> ResultType<()> {
     };
 
     // 创建输入管道服务器（Main → System 输入事件）
-    let (pipe_tx, _pipe_thread) = sos_pipe::create_pipe_server(sos_constants::INPUT_PIPE, sos_pipe::PIPE_ACCESS_OUTBOUND);
+    let (pipe_tx, pipe_thread) =
+        sos_pipe::create_pipe_server(sos_constants::INPUT_PIPE, sos_pipe::PIPE_ACCESS_OUTBOUND);
     crate::sos_pipe::set_down_tx(pipe_tx);
+
+    // 创建控制管道服务器（Main → System 启停捕获，独立管道）
+    let (ctrl_tx, ctrl_thread) =
+        sos_pipe::create_pipe_server(sos_constants::CONTROL_PIPE, sos_pipe::PIPE_ACCESS_OUTBOUND);
+    crate::sos_pipe::set_control_tx(ctrl_tx);
+
+    // 用 Arc<Mutex<Option<>>> 包装线程句柄，看门狗 join 后替换新句柄
+    let pipe_thread_ref = std::sync::Arc::new(std::sync::Mutex::new(Some(pipe_thread)));
+    let ctrl_thread_ref = std::sync::Arc::new(std::sync::Mutex::new(Some(ctrl_thread)));
 
     // 5. 以 SYSTEM 身份启动子进程（常驻）
     #[cfg(windows)]
@@ -196,28 +221,99 @@ async fn main() -> ResultType<()> {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
+    // 5a. SYSTEM 子进程存活看门狗：join 管道线程，死亡时自动重建 + 重启
+    #[cfg(windows)]
+    {
+        let debug = cli.debug;
+        let ptr = pipe_thread_ref.clone();
+        let ctr = ctrl_thread_ref.clone();
+        std::thread::spawn(move || loop {
+            // 阻塞等待管道线程退出（子进程死亡时 OS 关闭管道 → 线程退出 → join 返回）
+            // 用 ctrl_thread 作为代表：子进程一死，两个管道同时断开
+            let old_ctrl = ctr.lock().unwrap().take().unwrap();
+            let _ = old_ctrl.join();
+            log::warn!("SYSTEM sub-process pipe broken (ctrl_thread exited), restarting...");
+
+            // 重建管道，更新全局 sender
+            let (pt, pth) = sos_pipe::create_pipe_server(
+                sos_constants::INPUT_PIPE,
+                sos_pipe::PIPE_ACCESS_OUTBOUND,
+            );
+            let (ct, cth) = sos_pipe::create_pipe_server(
+                sos_constants::CONTROL_PIPE,
+                sos_pipe::PIPE_ACCESS_OUTBOUND,
+            );
+            sos_pipe::set_down_tx(pt);
+            sos_pipe::set_control_tx(ct);
+
+            // 同步清理可能还活着的旧 pipe_thread（子进程死亡后它也已退出或即将退出）
+            if let Some(old_pipe) = ptr.lock().unwrap().take() {
+                let _ = old_pipe.join();
+            }
+
+            // 放入新句柄供下一轮 join
+            *ptr.lock().unwrap() = Some(pth);
+            *ctr.lock().unwrap() = Some(cth);
+
+            // 启动新的 SYSTEM 子进程
+            sos_system::launch_system_sub_process(debug);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
+    }
+
     // 6. 启动上游 video_service（默认使用自身 DXGI，不劫持）
     log::info!("Starting upstream video service (DXGI)...");
-    let video_svc = librustdesk::video_service::new(librustdesk::video_service::VideoSource::Monitor, 0);
+    let video_svc =
+        librustdesk::video_service::new(librustdesk::video_service::VideoSource::Monitor, 0);
     sos_config::set_video_service(video_svc);
     log::info!("Video service started (upstream)");
 
     // 6a. UAC 监控：检测到安全桌面时注入自定义工厂
     #[cfg(windows)]
     {
-        let uac_w = { scrap::Display::all().unwrap_or_default().first().map(|d| d.width() as usize).unwrap_or(1920) };
-        let uac_h = { scrap::Display::all().unwrap_or_default().first().map(|d| d.height() as usize).unwrap_or(1080) };
+        let uac_w = {
+            scrap::Display::all()
+                .unwrap_or_default()
+                .first()
+                .map(|d| d.width() as usize)
+                .unwrap_or(1920)
+        };
+        let uac_h = {
+            scrap::Display::all()
+                .unwrap_or_default()
+                .first()
+                .map(|d| d.height() as usize)
+                .unwrap_or(1080)
+        };
         std::thread::spawn(move || loop {
             let uac = librustdesk::platform::windows::is_process_consent_running().unwrap_or(false);
             let has_factory = librustdesk::video_service::custom_capturer_factory_is_set();
             if uac && !has_factory {
+                // UAC 安全桌面激活 → 先发信号让 SYSTEM 子进程启动 GDI 捕获
+                log::info!("[UAC] consent.exe detected, sending START_CAPTURE via control pipe");
+                sos_pipe::try_send_control(
+                    sos_constants::MSG_CONTROL_START_CAPTURE
+                        .to_ne_bytes()
+                        .to_vec(),
+                );
+                // 短暂等待捕获线程启动并产出首帧（~33ms per frame + setup）
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                // 再注入 SHMEM 工厂让 video_service 切换捕获源
                 if let Ok(shmem) = sos_shmem::SosShmem::open_existing(sos_shmem::SHMEM_NAME) {
                     sos_shmem::register_shmem_and_factory(shmem, uac_w, uac_h);
                     log::info!("[UAC] Factory injected, video_service will switch to SOS SHMEM");
                 }
             } else if !uac && has_factory {
-                librustdesk::video_service::clear_custom_capturer_factory();
+                // UAC 安全桌面关闭 → 先清除工厂让 video_service 切回 DXGI
+                sos_shmem::clear_shmem_factory();
                 log::info!("[UAC] Factory cleared, video_service will switch back to DXGI");
+                // 再通过控制管道发信号让 SYSTEM 子进程停止 GDI 捕获
+                log::info!("[UAC] Sending STOP_CAPTURE via control pipe");
+                sos_pipe::try_send_control(
+                    sos_constants::MSG_CONTROL_STOP_CAPTURE
+                        .to_ne_bytes()
+                        .to_vec(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         });
@@ -257,12 +353,17 @@ async fn main() -> ResultType<()> {
     // 8. 启动信令注册任务（后台持续运行）
     let rendezvous_config = config.clone();
     let rendezvous_handle = tokio::spawn(async move {
-        if let Err(e) = sos_rendezvous::run(rendezvous_config, tray_tx_for_rendezvous, pwd_refresh_tx).await {
+        if let Err(e) =
+            sos_rendezvous::run(rendezvous_config, tray_tx_for_rendezvous, pwd_refresh_tx).await
+        {
             log::error!("Rendezvous service error: {}", e);
         }
     });
 
-    log::info!("SOS client is ready, ID: {}, waiting for incoming connections...", config.id);
+    log::info!(
+        "SOS client is ready, ID: {}, waiting for incoming connections...",
+        config.id
+    );
 
     // 9. 主事件循环：接受托盘命令 + 密码刷新通知 + 保持运行
     use std::sync::Mutex;

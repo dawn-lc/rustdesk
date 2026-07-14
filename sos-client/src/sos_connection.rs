@@ -362,7 +362,8 @@ async fn run_service_loop(mut stream: Stream, _config: SosConfig) -> ResultType<
     use tokio::time::{sleep, Duration};
 
     // 文件传输
-    let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new();
+    let (ft_tx, mut ft_rx) = tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
+    let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new(ft_tx);
 
     // ── 订阅上游 video_service + clipboard_service ──
     use hbb_common::tokio::time::Instant as TokioInstant;
@@ -405,7 +406,7 @@ async fn run_service_loop(mut stream: Stream, _config: SosConfig) -> ResultType<
         qos.user_network_delay(conn_id, 10);
     }
 
-    let heartbeat_interval = Duration::from_secs(30);
+    let heartbeat_interval = Duration::from_secs(10);
     let mut test_delay_timer = tokio::time::interval(Duration::from_secs(1));
     let mut network_delay = 0u32;
     let mut last_test_delay: Option<std::time::Instant> = None;
@@ -497,16 +498,18 @@ async fn run_service_loop(mut stream: Stream, _config: SosConfig) -> ResultType<
                 }
             }
 
-            // 文件传输响应
+            // 文件传输响应（tokio mpsc 直接 await）
+            Some(resp) = ft_rx.recv() => {
+                if let Err(e) = stream.send(&resp).await {
+                    log::error!("Failed to send file response: {}", e);
+                    send_close_reason(&mut stream, "File send error").await;
+                    break;
+                }
+            }
+
+            // 文件传输 send job 轮询
             _ = sleep(if file_transfer.has_send_jobs() { Duration::from_millis(10) } else { Duration::from_secs(1) }) => {
                 file_transfer.poll_send_jobs().await;
-                while let Some(resp) = file_transfer.try_recv_response() {
-                    if let Err(e) = stream.send(&resp).await {
-                        log::error!("Failed to send file response: {}", e);
-                        send_close_reason(&mut stream, "File send error").await;
-                        break;
-                    }
-                }
             }
 
             // TestDelay：每 1 秒发送给客户端（供其显示延迟和码率）
@@ -569,11 +572,12 @@ async fn run_file_transfer_loop(
 ) -> ResultType<()> {
     use tokio::time::{sleep, Duration};
 
-    let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new();
+    let (ft_tx, mut ft_rx) = tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
+    let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new(ft_tx);
+    let mut keepalive_timer = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         tokio::select! {
-            // 接收远程消息
             msg = stream.next() => {
                 match msg {
                     Some(Ok(data)) => {
@@ -591,15 +595,21 @@ async fn run_file_transfer_loop(
                     }
                 }
             }
-            // 文件传输响应轮询
+            Some(resp) = ft_rx.recv() => {
+                if let Err(e) = stream.send(&resp).await {
+                    log::error!("Failed to send file response: {}", e);
+                    break;
+                }
+            }
             _ = sleep(if file_transfer.has_send_jobs() { Duration::from_millis(10) } else { Duration::from_secs(1) }) => {
                 file_transfer.poll_send_jobs().await;
-                while let Some(resp) = file_transfer.try_recv_response() {
-                    if let Err(e) = stream.send(&resp).await {
-                        log::error!("Failed to send file response: {}", e);
-                        break;
-                    }
-                }
+            }
+            _ = keepalive_timer.tick() => {
+                let mut misc = Misc::new();
+                misc.set_portable_service_running(true);
+                let mut msg = Message::new();
+                msg.set_misc(misc);
+                let _ = stream.send(&msg).await;
             }
         }
     }
@@ -746,22 +756,7 @@ async fn handle_incoming_message(
         }
     } else if msg.has_file_action() {
         file_transfer.handle_action(msg.file_action());
-        let mut sent = 0usize;
-        // 立即发送响应，避免轮询延迟（客户端超时通常 < 1 秒）
-        while let Some(resp) = file_transfer.try_recv_response() {
-            sent += 1;
-            let has_fr = resp.has_file_response();
-            let has_dir = has_fr && resp.file_response().has_dir();
-            log::info!("[FT] Sending file response #{} (has_file_response={}, has_dir={})",
-                sent, has_fr, has_dir);
-            if let Err(e) = stream.send(&resp).await {
-                log::error!("[FT] Failed to send file response #{}: {}", sent, e);
-                break;
-            }
-        }
-        if sent == 0 {
-            log::warn!("[FT] No response sent for file action (possible issue)");
-        }
+        // 响应由 tokio mpsc channel 经 select! 中 ft_rx.recv() 异步发送
     } else if msg.has_file_response() {
         use hbb_common::message_proto::file_response;
         let resp = msg.file_response();

@@ -23,10 +23,14 @@ pub async fn run(
     _tray_tx: std::sync::mpsc::Sender<crate::sos_tray::TrayCommand>,
     password_refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> ResultType<()> {
-    let host = check_port(&config.rendezvous_server, crate::sos_constants::RENDEZVOUS_PORT);
+    let host = check_port(
+        &config.rendezvous_server,
+        crate::sos_constants::RENDEZVOUS_PORT,
+    );
     log::info!("Connecting to rendezvous server: {}", host);
 
-    let (mut socket, target_addr) = new_udp_for(&host, crate::sos_constants::CONNECT_TIMEOUT).await?;
+    let (mut socket, target_addr) =
+        new_udp_for(&host, crate::sos_constants::CONNECT_TIMEOUT).await?;
     let mut peer_addr: std::net::SocketAddr = target_addr.into_target_addr()?.into();
     log::info!("UDP connection to rendezvous server established");
 
@@ -71,7 +75,15 @@ pub async fn run(
         match hbb_common::timeout(listen_timeout.as_millis() as u64, socket.next()).await {
             Ok(Some(Ok((bytes, _from)))) => {
                 if let Ok(rm) = RendezvousMessage::parse_from_bytes(&bytes) {
-                    if let Err(e) = handle_rendezvous_message(rm, &mut config, &mut socket, &peer_addr, &password_refresh_tx).await {
+                    if let Err(e) = handle_rendezvous_message(
+                        rm,
+                        &mut config,
+                        &mut socket,
+                        &peer_addr,
+                        &password_refresh_tx,
+                    )
+                    .await
+                    {
                         log::warn!("Handle rendezvous message error: {}", e);
                         // 不退出，下次循环继续
                     }
@@ -86,12 +98,17 @@ pub async fn run(
                 match new_udp_for(&host, crate::sos_constants::CONNECT_TIMEOUT).await {
                     Ok((new_sock, new_addr)) => {
                         socket = new_sock;
-                        peer_addr = new_addr.into_target_addr().map(|a| a.into()).unwrap_or_else(|_| {
-                            log::warn!("Failed to resolve target addr, using previous");
-                            peer_addr
-                        });
+                        peer_addr = new_addr
+                            .into_target_addr()
+                            .map(|a| a.into())
+                            .unwrap_or_else(|_| {
+                                log::warn!("Failed to resolve target addr, using previous");
+                                peer_addr
+                            });
                         let s = serial.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Err(e) = send_register_peer(&mut socket, &peer_addr, &config.id, s).await {
+                        if let Err(e) =
+                            send_register_peer(&mut socket, &peer_addr, &config.id, s).await
+                        {
                             log::warn!("Re-register after reconnection failed: {}", e);
                         }
                         last_reg = Instant::now();
@@ -255,7 +272,8 @@ async fn send_local_addr_fla(
         &config.rendezvous_server,
         crate::sos_constants::RENDEZVOUS_PORT,
     );
-    let mut tcp_stream = connect_tcp(rendezvous_host, crate::sos_constants::CONNECT_TIMEOUT).await?;
+    let mut tcp_stream =
+        connect_tcp(rendezvous_host, crate::sos_constants::CONNECT_TIMEOUT).await?;
 
     // 获取本端 TCP socket 地址，用 AddrMangle 编码
     let local_sock_addr = tcp_stream.local_addr();
@@ -376,8 +394,6 @@ async fn test_nat_type(rendezvous_host: &str) {
     );
 }
 
-
-
 /// 处理 PunchHole（直连打洞请求）
 ///
 /// 对端想通过直连 TCP 连接。我们从 PunchHole 中提取对端地址
@@ -394,8 +410,8 @@ async fn handle_punch_hole(
 
     // 检查双方 NAT 类型：如果任意一方为 SYMMETRIC，打洞无效，直接中继
     let remote_nat = ph.nat_type.enum_value().unwrap_or(NatType::UNKNOWN_NAT);
-    let our_nat = NatType::from_i32(crate::sos_config::get_nat_type())
-        .unwrap_or(NatType::UNKNOWN_NAT);
+    let our_nat =
+        NatType::from_i32(crate::sos_config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
 
     if remote_nat == NatType::SYMMETRIC || our_nat == NatType::SYMMETRIC {
         log::info!(
@@ -403,7 +419,15 @@ async fn handle_punch_hole(
             remote_nat,
             our_nat
         );
-        return handle_relay_fallback(&ph.relay_server, &config, &password_refresh_tx, ph.socket_addr.clone()).await;
+        return handle_relay_fallback(
+            &ph.relay_server,
+            &config,
+            &password_refresh_tx,
+            ph.socket_addr.clone(),
+            None,
+            "",
+        )
+        .await;
     }
 
     // 尝试从 socket_addr 解析对端地址
@@ -411,7 +435,15 @@ async fn handle_punch_hole(
 
     if peer_addr.is_empty() {
         log::warn!("PunchHole 缺少对端地址，尝试中继");
-        return handle_relay_fallback(&ph.relay_server, &config, &password_refresh_tx, ph.socket_addr.clone()).await;
+        return handle_relay_fallback(
+            &ph.relay_server,
+            &config,
+            &password_refresh_tx,
+            ph.socket_addr.clone(),
+            None,
+            "",
+        )
+        .await;
     }
 
     log::info!("尝试直连对端: {}", peer_addr);
@@ -420,7 +452,13 @@ async fn handle_punch_hole(
     match result {
         Ok(stream) => {
             log::info!("IPv4 直连成功，启动连接处理...");
-            return crate::sos_connection::handle(stream, "0.0.0.0:0".parse().unwrap(), config, Some(&password_refresh_tx)).await;
+            return crate::sos_connection::handle(
+                stream,
+                "0.0.0.0:0".parse().unwrap(),
+                config,
+                Some(&password_refresh_tx),
+            )
+            .await;
         }
         Err(e) => {
             // 如果 PunchHole 包含 IPv6 地址，尝试 IPv6 直连
@@ -430,7 +468,13 @@ async fn handle_punch_hole(
                 match connect_tcp(v6_addr.as_ref(), crate::sos_constants::CONNECT_TIMEOUT).await {
                     Ok(stream) => {
                         log::info!("IPv6 直连成功，启动连接处理...");
-                        return crate::sos_connection::handle(stream, "0.0.0.0:0".parse().unwrap(), config, Some(&password_refresh_tx)).await;
+                        return crate::sos_connection::handle(
+                            stream,
+                            "0.0.0.0:0".parse().unwrap(),
+                            config,
+                            Some(&password_refresh_tx),
+                        )
+                        .await;
                     }
                     Err(e2) => {
                         log::warn!("IPv6 直连也失败 ({}), 尝试中继", e2);
@@ -439,7 +483,15 @@ async fn handle_punch_hole(
             } else {
                 log::warn!("IPv4 直连失败 ({}), 尝试中继", e);
             }
-            handle_relay_fallback(&ph.relay_server, &config, &password_refresh_tx, ph.socket_addr.clone()).await
+            handle_relay_fallback(
+                &ph.relay_server,
+                &config,
+                &password_refresh_tx,
+                ph.socket_addr.clone(),
+                None,
+                "",
+            )
+            .await
         }
     }
 }
@@ -447,6 +499,7 @@ async fn handle_punch_hole(
 /// 处理 RequestRelay（中继请求）
 ///
 /// 对端要求通过中继服务器建立连接。
+/// 关键：必须复用客户端的 uuid，否则中继服务器无法配对双方连接。
 async fn handle_request_relay(
     rr: RequestRelay,
     config: SosConfig,
@@ -456,7 +509,26 @@ async fn handle_request_relay(
     if relay_host.is_empty() {
         return Err(anyhow::anyhow!("Relay server address is empty"));
     }
-    handle_relay_fallback(relay_host, &config, &password_refresh_tx, rr.socket_addr.clone()).await
+    // 使用客户端的 uuid（客户端已用它连接中继服务器，必须一致）
+    let uuid = if rr.uuid.is_empty() {
+        None
+    } else {
+        Some(rr.uuid.clone())
+    };
+    let peer_id = if rr.id.is_empty() {
+        String::new()
+    } else {
+        rr.id.clone()
+    };
+    handle_relay_fallback(
+        relay_host,
+        &config,
+        &password_refresh_tx,
+        rr.socket_addr.clone(),
+        uuid,
+        &peer_id,
+    )
+    .await
 }
 
 /// 通过中继服务器建立连接
@@ -468,29 +540,40 @@ async fn handle_request_relay(
 /// 4. 中继服务器桥接本端与对端，随后进行密钥交换
 ///
 /// `peer_socket_addr` 是对端（远程客户端）的地址，来自 PunchHole 或 RequestRelay
+/// `uuid` 为客户端生成的共享 uuid（来自 RequestRelay），若为 None 则随机生成（PunchHole 回退场景）
+/// `peer_id` 为对端设备 ID（来自 RequestRelay），PunchHole 场景下为空字符串
 async fn handle_relay_fallback(
     relay_host: &str,
     config: &SosConfig,
     password_refresh_tx: &tokio::sync::mpsc::UnboundedSender<()>,
     peer_socket_addr: hbb_common::bytes::Bytes,
+    uuid: Option<String>,
+    peer_id: &str,
 ) -> ResultType<()> {
     // 1. 向信令服务器发送 RelayResponse
     let rendezvous_host = check_port(
         &config.rendezvous_server,
         crate::sos_constants::RENDEZVOUS_PORT,
     );
-    log::info!("连接信令服务器请求中继: {} -> relay={}", rendezvous_host, relay_host);
+    log::info!(
+        "连接信令服务器请求中继: {} -> relay={}",
+        rendezvous_host,
+        relay_host
+    );
 
-    // 生成共享 uuid，用于 RelayResponse 和后续 RequestRelay
-    use hbb_common::rand::Rng;
-    let uuid_str: String = hbb_common::rand::thread_rng()
-        .sample_iter(&hbb_common::rand::distributions::Alphanumeric)
-        .take(16)
-        .map(char::from)
-        .collect();
+    // uuid：优先使用客户端提供的（RequestRelay 场景），否则随机生成（PunchHole 回退场景）
+    let uuid_str = uuid.unwrap_or_else(|| {
+        use hbb_common::rand::Rng;
+        hbb_common::rand::thread_rng()
+            .sample_iter(&hbb_common::rand::distributions::Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect()
+    });
 
     {
-        let mut stream = connect_tcp(rendezvous_host, crate::sos_constants::CONNECT_TIMEOUT).await?;
+        let mut stream =
+            connect_tcp(rendezvous_host, crate::sos_constants::CONNECT_TIMEOUT).await?;
 
         // 构造 RelayResponse（与 RustDesk create_relay 一致）
         let mut rr = hbb_common::rendezvous_proto::RelayResponse::new();
@@ -504,29 +587,48 @@ async fn handle_relay_fallback(
 
         let bytes = msg.write_to_bytes()?;
         stream.send_raw(bytes).await?;
-        log::info!("RelayResponse sent to rendezvous server");
+        log::info!(
+            "RelayResponse sent to rendezvous server (uuid={})",
+            uuid_str
+        );
     } // 信令服务器关闭连接，stream 自动断开
 
     // 2. 连接中继服务器，发送 RequestRelay（与 RustDesk create_relay_connection 一致）
-    let relay_host_port = hbb_common::socket_client::check_port(
-        relay_host,
-        hbb_common::config::RELAY_PORT,
-    );
+    let relay_host_port =
+        hbb_common::socket_client::check_port(relay_host, hbb_common::config::RELAY_PORT);
     log::info!("连接中继服务器: {}", relay_host_port);
 
-    let mut relay_stream = connect_tcp(relay_host_port, crate::sos_constants::CONNECT_TIMEOUT).await?;
+    let mut relay_stream =
+        connect_tcp(relay_host_port, crate::sos_constants::CONNECT_TIMEOUT).await?;
 
-    // 构造 RequestRelay 消息（与 RustDesk create_relay_connection_ 一致）
+    // 构造 RequestRelay 消息（与上游 create_relay_connection_ 和 client::create_relay 对齐）
+    // licence_key：优先使用配置中的 server_pub_key，空则回退 RS_PUB_KEY
+    let licence_key = if !config.server_pub_key.is_empty() {
+        config.server_pub_key.clone()
+    } else {
+        hbb_common::config::RS_PUB_KEY.to_string()
+    };
     let mut msg = hbb_common::rendezvous_proto::RendezvousMessage::new();
-    msg.set_request_relay(hbb_common::rendezvous_proto::RequestRelay {
-        uuid: uuid_str,  // 与 RelayResponse 中同一个 uuid
-        licence_key: hbb_common::config::RS_PUB_KEY.to_string(),
-        ..Default::default()
-    });
+    let mut rr = hbb_common::rendezvous_proto::RequestRelay::new();
+    rr.uuid = uuid_str.clone();
+    rr.licence_key = licence_key;
+    rr.id = peer_id.to_string();
+    rr.conn_type = hbb_common::rendezvous_proto::ConnType::DEFAULT_CONN.into();
+    msg.set_request_relay(rr);
 
     let bytes = msg.write_to_bytes()?;
     relay_stream.send_raw(bytes).await?;
-    log::info!("RequestRelay sent to relay server, waiting for bridge...");
+    log::info!(
+        "RequestRelay sent to relay server (uuid={}, peer_id={}), waiting for bridge...",
+        uuid_str,
+        peer_id
+    );
 
-    crate::sos_connection::handle(relay_stream, "0.0.0.0:0".parse().unwrap(), config.clone(), Some(&password_refresh_tx)).await
+    crate::sos_connection::handle(
+        relay_stream,
+        "0.0.0.0:0".parse().unwrap(),
+        config.clone(),
+        Some(&password_refresh_tx),
+    )
+    .await
 }

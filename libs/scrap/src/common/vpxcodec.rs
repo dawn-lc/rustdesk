@@ -70,7 +70,8 @@ impl EncoderApi for VpxEncoder {
                 c.rc_undershoot_pct = 95;
                 // When the data buffer falls below this percentage of fullness, a dropped frame is indicated. Set the threshold to zero (0) to disable this feature.
                 // In dynamic scenes, low bitrate gets low fps while high bitrate gets high fps.
-                c.rc_dropframe_thresh = 25;
+                // SOS: disable frame dropping — remote desktop needs every frame
+                c.rc_dropframe_thresh = 0;
                 c.g_threads = codec_thread_num(64) as _;
                 c.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
                 // https://developers.google.com/media/vp9/bitrate-modes/
@@ -88,6 +89,11 @@ impl EncoderApi for VpxEncoder {
                 c.rc_max_quantizer = q_max;
                 c.rc_target_bitrate =
                     Self::bitrate(config.width as _, config.height as _, config.quality);
+                // SOS: enlarge CBR buffer to 5x target bitrate to absorb motion spikes.
+                // Default is 1x (= rc_target_bitrate), which overflows instantly on large window drags.
+                c.rc_buf_sz = c.rc_target_bitrate * 5;
+                c.rc_buf_initial_sz = c.rc_buf_sz;
+                c.rc_buf_optimal_sz = c.rc_target_bitrate;
                 // https://chromium.googlesource.com/webm/libvpx/+/refs/heads/main/vp9/common/vp9_enums.h#29
                 // https://chromium.googlesource.com/webm/libvpx/+/refs/heads/main/vp8/vp8_cx_iface.c#282
                 c.g_profile = if i444 && config.codec == VpxVideoCodecId::VP9 {
@@ -231,7 +237,12 @@ impl EncoderApi for VpxEncoder {
 }
 
 impl VpxEncoder {
-    pub fn encode<'a>(&'a mut self, pts: i64, data: &[u8], stride_align: usize) -> Result<EncodeFrames<'a>> {
+    pub fn encode<'a>(
+        &'a mut self,
+        pts: i64,
+        data: &[u8],
+        stride_align: usize,
+    ) -> Result<EncodeFrames<'a>> {
         let bpp = if self.i444 { 24 } else { 12 };
         if data.len() < self.width * self.height * bpp / 8 {
             return Err(Error::FailedCall("len not enough".to_string()));

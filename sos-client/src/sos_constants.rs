@@ -30,9 +30,16 @@ pub const APP_NAME: &str = "RustDesk SOS";
 /// 输入管道名（Main → System 输入事件）
 pub const INPUT_PIPE: &str = r"\\.\pipe\sos_input";
 
-/// 管道消息类型
+/// 控制管道名（Main → System 启停捕获）
+pub const CONTROL_PIPE: &str = r"\\.\pipe\sos_control";
+
+/// 输入管道消息类型
 pub const MSG_MOUSE: u32 = 1;
 pub const MSG_KEY: u32 = 2;
 pub const MSG_SHUTDOWN: u32 = 3;
+
+/// 控制管道消息类型（独立管道，不复用 INPUT_PIPE）
+pub const MSG_CONTROL_START_CAPTURE: u32 = 1;
+pub const MSG_CONTROL_STOP_CAPTURE: u32 = 2;
 
 

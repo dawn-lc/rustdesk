@@ -118,10 +118,27 @@ unsafe fn send_pipe_message(pipe: isize, data: &[u8]) -> bool {
 
 // ── 全局发送端（main → sos_connection → pipe）─
 
-static DOWN_TX: std::sync::OnceLock<std::sync::mpsc::Sender<Vec<u8>>> = std::sync::OnceLock::new();
+static DOWN_TX: std::sync::RwLock<Option<std::sync::mpsc::Sender<Vec<u8>>>> =
+    std::sync::RwLock::new(None);
 
-pub fn set_down_tx(tx: std::sync::mpsc::Sender<Vec<u8>>) { let _ = DOWN_TX.set(tx); }
+pub fn set_down_tx(tx: std::sync::mpsc::Sender<Vec<u8>>) {
+    *DOWN_TX.write().unwrap() = Some(tx);
+}
 
 pub fn try_send_input(msg: Vec<u8>) {
-    if let Some(tx) = DOWN_TX.get() { tx.send(msg).ok(); }
+    if let Some(tx) = DOWN_TX.read().unwrap().as_ref() { tx.send(msg).ok(); }
+}
+
+// ── 控制管道发送端（main → SYSTEM 子进程，独立管道）─
+
+static CONTROL_TX: std::sync::RwLock<Option<std::sync::mpsc::Sender<Vec<u8>>>> =
+    std::sync::RwLock::new(None);
+
+pub fn set_control_tx(tx: std::sync::mpsc::Sender<Vec<u8>>) {
+    *CONTROL_TX.write().unwrap() = Some(tx);
+}
+
+/// 通过独立控制管道向 SYSTEM 子进程发送消息（msg 为 4B msg_type）
+pub fn try_send_control(msg: Vec<u8>) {
+    if let Some(tx) = CONTROL_TX.read().unwrap().as_ref() { tx.send(msg).ok(); }
 }

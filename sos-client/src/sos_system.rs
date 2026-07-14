@@ -139,19 +139,33 @@ pub fn run_service() -> ResultType<()> {
         return Ok(());
     }
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::sos_pipe::*;
-    use crate::sos_constants::INPUT_PIPE;
+    use crate::sos_constants::{INPUT_PIPE, CONTROL_PIPE, MSG_CONTROL_START_CAPTURE, MSG_CONTROL_STOP_CAPTURE};
     log_token_info("SUB_INIT");
 
     // 连接输入管道
     log::info!("Connecting to input pipe: {}", INPUT_PIPE);
-    let pipe = match connect_pipe_client(INPUT_PIPE, 6) {
+    let input_pipe = match connect_pipe_client(INPUT_PIPE, 6) {
         Some(h) => h,
         None => { log::error!("Failed to connect input pipe"); return Ok(()); }
     };
 
-    // 启动独立输入线程
-    let input_pipe = pipe;
+    // 连接控制管道（独立管道，不混入输入事件流）
+    log::info!("Connecting to control pipe: {}", CONTROL_PIPE);
+    let control_pipe = match connect_pipe_client(CONTROL_PIPE, 6) {
+        Some(h) => h,
+        None => { log::error!("Failed to connect control pipe"); return Ok(()); }
+    };
+
+    // 捕获启停标志：初始为 false（暂停），主进程 UAC 检测线程通过独立控制管道控制
+    let capture_active = Arc::new(AtomicBool::new(false));
+    // 捕获线程句柄：控制线程在发 START 时 unpark 以实现零延迟唤醒
+    let cap_thread_handle: Arc<std::sync::Mutex<Option<std::thread::Thread>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // 输入线程：读输入管道 → 分派输入事件
     let input_thread = std::thread::spawn(move || {
         loop {
             let data = match unsafe { read_message(input_pipe) } {
@@ -166,9 +180,48 @@ pub fn run_service() -> ResultType<()> {
         std::process::exit(0);
     });
 
-    // GDI 捕获（主线程阻塞）
-    crate::sos_capture::run(crate::sos_shmem::SHMEM_NAME);
+    // 控制线程：读控制管道 → 更新 AtomicBool + unpark 捕获线程
+    let cap_active = capture_active.clone();
+    let cap_handle = cap_thread_handle.clone();
+    let control_thread = std::thread::spawn(move || {
+        loop {
+            let data = match unsafe { read_message(control_pipe) } {
+                Some(d) => d,
+                None => break,
+            };
+            if data.len() < 4 { continue; }
+            let msg_type = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+            match msg_type {
+                MSG_CONTROL_START_CAPTURE => {
+                    log::info!("[CTRL] Received START_CAPTURE signal");
+                    cap_active.store(true, Ordering::SeqCst);
+                    // 立即唤醒捕获线程（替代 100ms 轮询延迟）
+                    if let Some(t) = cap_handle.lock().unwrap().as_ref() {
+                        t.unpark();
+                    }
+                }
+                MSG_CONTROL_STOP_CAPTURE => {
+                    log::info!("[CTRL] Received STOP_CAPTURE signal");
+                    cap_active.store(false, Ordering::SeqCst);
+                }
+                other => log::warn!("[CTRL] Unknown control message: {}", other),
+            }
+        }
+        log::warn!("[CTRL] Control pipe disconnected");
+        cap_active.store(false, Ordering::SeqCst);
+        std::process::exit(0);
+    });
+
+    // 捕获线程：按需 GDI 捕获
+    let cap_thread = std::thread::spawn(move || {
+        // 存储自身句柄，供控制线程 unpark
+        *cap_thread_handle.lock().unwrap() = Some(std::thread::current());
+        crate::sos_capture::run(crate::sos_shmem::SHMEM_NAME, capture_active);
+    });
+
     let _ = input_thread.join();
+    let _ = control_thread.join();
+    let _ = cap_thread.join();
     Ok(())
 }
 

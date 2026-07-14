@@ -80,6 +80,9 @@ static SHMEM_STATE: std::sync::Mutex<Option<(SosShmem, usize, usize)>> =
     std::sync::Mutex::new(None);
 // (shmem, width, height)
 
+/// 标记 factory 是否有效：清除时设为 false，capturer 检测到此标志会返回错误触发 video_service 重启
+static SHMEM_FACTORY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 注入 SHMEM 状态并注册自定义捕获器工厂到 video_service。
 /// 首次调用时存储 `SosShmem`（持有所有权），后续调用复用已有映射。
 pub fn register_shmem_and_factory(
@@ -103,6 +106,7 @@ pub fn register_shmem_and_factory(
 
     // 先清除再设置（确保动态切换生效）
     librustdesk::video_service::clear_custom_capturer_factory();
+    SHMEM_FACTORY_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     librustdesk::video_service::set_custom_capturer_factory(
         Box::new(|_current, _display, _running| {
             let state = SHMEM_STATE.lock().unwrap();
@@ -117,6 +121,14 @@ pub fn register_shmem_and_factory(
 /// 清除 SHMEM 状态和工厂（进程退出时调用，释放共享内存）
 pub fn clear_shmem_state() {
     *SHMEM_STATE.lock().unwrap() = None;
+}
+
+/// 清除工厂并标记 SHMEM 无效（UAC 退出时调用）
+/// capturer 检测到此标志会返回错误，触发 video_service 重启回 DXGI
+pub fn clear_shmem_factory() {
+    SHMEM_FACTORY_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    librustdesk::video_service::clear_custom_capturer_factory();
+    log::info!("SHMEM factory cleared, capturers will restart");
 }
 
 /// 创建 SOS 自有 SHMEM，返回内存对象。
@@ -218,6 +230,11 @@ impl SosShmemCapturer {
 impl scrap::TraitCapturer for SosShmemCapturer {
     fn frame<'a>(&'a mut self, _timeout: std::time::Duration) -> std::io::Result<scrap::Frame<'a>> {
         use scrap::Frame;
+
+        // 检查 factory 是否已被清除（UAC 退出），是则返回错误触发 video_service 重启
+        if !SHMEM_FACTORY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "shmem factory cleared"));
+        }
 
         let wcnt = self.read_counter();
         let ecnt = self.read_counter_echo();

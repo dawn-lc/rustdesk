@@ -139,6 +139,8 @@ impl log::Log for FileLogger {
         let mut file = self.file.lock().unwrap();
         let _ = file.write_all(msg.as_bytes());
         let _ = file.flush();
+        // 同时输出到 stderr，确保控制台可见
+        let _ = std::io::stderr().write_all(msg.as_bytes());
     }
 
     fn flush(&self) {
