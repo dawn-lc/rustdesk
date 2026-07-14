@@ -340,9 +340,8 @@ async fn main() -> ResultType<()> {
     // 6. 创建托盘
     let (tray_tx, tray_rx) = mpsc::channel::<sos_tray::TrayCommand>();
     let tray_tx_for_rendezvous = tray_tx.clone();
-    let tray_id = config.id.clone();
     std::thread::spawn(move || {
-        if let Err(e) = sos_tray::run(tray_tx, tray_id) {
+        if let Err(e) = sos_tray::run(tray_tx) {
             log::error!("Tray thread error: {}", e);
         }
     });

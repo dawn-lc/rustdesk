@@ -4,9 +4,8 @@
 //! 密钥交换 → 登录验证 → 视频/输入/剪贴板/文件 7 路并发
 
 use crate::sos_config::SosConfig;
-use hbb_common::{protos::message::*, ResultType, Stream};
 use hbb_common::protobuf::Message as ProtobufMessage;
-
+use hbb_common::{protos::message::*, ResultType, Stream};
 
 /// 处理单个远程连接
 pub async fn handle(
@@ -16,7 +15,10 @@ pub async fn handle(
     pwd_refresh_tx: Option<&tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> ResultType<()> {
     let addr_str = peer_addr.ip().to_string();
-    log::info!("New connection from {}, performing key exchange...", addr_str);
+    log::info!(
+        "New connection from {}, performing key exchange...",
+        addr_str
+    );
 
     // 检查登录频率限制
     let wait = check_login_rate_limit(&addr_str);
@@ -44,8 +46,12 @@ pub async fn handle(
     use hbb_common::rand::Rng;
     use hbb_common::sha2::{Digest, Sha256};
     let salt = crate::sos_config::RegistryConfig::get_password_salt();
-    let challenge: String = (0..6).map(|_| hbb_common::rand::thread_rng()
-        .sample(hbb_common::rand::distributions::Alphanumeric) as char).collect();
+    let challenge: String = (0..6)
+        .map(|_| {
+            hbb_common::rand::thread_rng().sample(hbb_common::rand::distributions::Alphanumeric)
+                as char
+        })
+        .collect();
 
     // 发送 Hash 给客户端（仅一次）
     {
@@ -141,7 +147,11 @@ pub async fn handle(
             continue;
         } else {
             login_attempts += 1;
-            log::warn!("Login authorization failed from {} (attempt {})", addr_str, login_attempts);
+            log::warn!(
+                "Login authorization failed from {} (attempt {})",
+                addr_str,
+                login_attempts
+            );
             record_login_failure(&addr_str);
             // 发送错误消息，不关闭连接（客户端会弹出重试对话框）
             send_login_error(&mut stream, "Wrong Password").await;
@@ -181,8 +191,13 @@ async fn setup_encrypted_stream(mut stream: Stream, device_id: &str) -> ResultTy
     // 获取本机 Ed25519 密钥对（用于签名）
     let (sk_bytes, pk_bytes) = crate::sos_config::RegistryConfig::get_key_pair();
     if sk_bytes.len() != sign::SECRETKEYBYTES || pk_bytes.len() != sign::PUBLICKEYBYTES {
-        anyhow::bail!("Invalid Ed25519 key pair: sk={}, pk={} (expected {},{})",
-            sk_bytes.len(), pk_bytes.len(), sign::SECRETKEYBYTES, sign::PUBLICKEYBYTES);
+        anyhow::bail!(
+            "Invalid Ed25519 key pair: sk={}, pk={} (expected {},{})",
+            sk_bytes.len(),
+            pk_bytes.len(),
+            sign::SECRETKEYBYTES,
+            sign::PUBLICKEYBYTES
+        );
     }
     let mut sk_arr = [0u8; sign::SECRETKEYBYTES];
     sk_arr.copy_from_slice(&sk_bytes);
@@ -196,7 +211,8 @@ async fn setup_encrypted_stream(mut stream: Stream, device_id: &str) -> ResultTy
         id: device_id.to_string(),
         pk: hbb_common::bytes::Bytes::from(na_pk.0.to_vec()),
         ..Default::default()
-    }.write_to_bytes()?;
+    }
+    .write_to_bytes()?;
 
     // 用 Ed25519 签名
     let signed_id = sign::sign(&id_pk_bytes, &ed_sk);
@@ -210,7 +226,9 @@ async fn setup_encrypted_stream(mut stream: Stream, device_id: &str) -> ResultTy
     stream.send(&msg_out).await?;
 
     // 等待 PublicKey 响应
-    let pk_data = stream.next_timeout(10_000).await
+    let pk_data = stream
+        .next_timeout(10_000)
+        .await
         .ok_or_else(|| anyhow::anyhow!("Timeout waiting for PublicKey"))??;
     let pk_msg = hbb_common::protos::message::Message::parse_from_bytes(&pk_data)?;
     let public_key = pk_msg.public_key();
@@ -236,17 +254,18 @@ async fn setup_encrypted_stream(mut stream: Stream, device_id: &str) -> ResultTy
 }
 
 /// 登录失败追踪（指数退避暴力破解防护）
-const BACKOFF_BASE_SECS: u64 = 2;   // 2^failures 秒
+const BACKOFF_BASE_SECS: u64 = 2; // 2^failures 秒
 const BACKOFF_MAX_SECS: u64 = 1800; // 30 分钟上限
-const IDLE_RESET_SECS: u64 = 7200;  // 2 小时无失败重置
+const IDLE_RESET_SECS: u64 = 7200; // 2 小时无失败重置
 
 struct LoginFailure {
     count: u32,
     last_fail: std::time::Instant,
 }
 
-static LOGIN_FAILURES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, LoginFailure>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static LOGIN_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, LoginFailure>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 检查该地址是否被限流。返回等待秒数（0=允许登录）。
 fn check_login_rate_limit(peer_addr: &str) -> u64 {
@@ -318,6 +337,16 @@ async fn send_login_response(stream: &mut Stream) -> ResultType<()> {
         }
         peer_info.current_display = 0;
         log::info!("Sent display info: {} displays", peer_info.displays.len());
+
+        // 填充支持的分辨率列表（控制端据此显示"更改分辨率"菜单）
+        if let Some(d) = displays.get(0) {
+            use hbb_common::message_proto::SupportedResolutions;
+            peer_info.resolutions = Some(SupportedResolutions {
+                resolutions: librustdesk::platform::resolutions(&d.name()),
+                ..Default::default()
+            })
+            .into();
+        }
     }
 
     // 上报功能支持（客户端据此决定输入模式等行为）
@@ -362,13 +391,20 @@ async fn run_service_loop(mut stream: Stream, _config: SosConfig) -> ResultType<
     use tokio::time::{sleep, Duration};
 
     // 文件传输
-    let (ft_tx, mut ft_rx) = tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
+    let (ft_tx, mut ft_rx) =
+        tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
     let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new(ft_tx);
 
     // ── 订阅上游 video_service + clipboard_service ──
     use hbb_common::tokio::time::Instant as TokioInstant;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(TokioInstant, std::sync::Arc<hbb_common::protos::message::Message>)>();
-    let (tx_video, mut rx_video) = tokio::sync::mpsc::unbounded_channel::<(TokioInstant, std::sync::Arc<hbb_common::protos::message::Message>)>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
+        TokioInstant,
+        std::sync::Arc<hbb_common::protos::message::Message>,
+    )>();
+    let (tx_video, mut rx_video) = tokio::sync::mpsc::unbounded_channel::<(
+        TokioInstant,
+        std::sync::Arc<hbb_common::protos::message::Message>,
+    )>();
     let conn_id = 1;
 
     if let Some(video_svc) = crate::sos_config::VIDEO_SVC.get() {
@@ -379,7 +415,10 @@ async fn run_service_loop(mut stream: Stream, _config: SosConfig) -> ResultType<
     if let Some(clip_svc) = crate::sos_config::CLIPBOARD_SVC.get() {
         let inner = librustdesk::ConnInner::new(conn_id, Some(tx.clone()), None);
         librustdesk::service::Service::on_subscribe(clip_svc, inner);
-        log::info!("Subscribed to upstream clipboard service as conn #{}", conn_id);
+        log::info!(
+            "Subscribed to upstream clipboard service as conn #{}",
+            conn_id
+        );
     }
 
     // ── 订阅光标和位置服务（使客户端显示正常鼠标样式而非触控样式）──
@@ -553,7 +592,10 @@ async fn run_service_loop(mut stream: Stream, _config: SosConfig) -> ResultType<
     // 取消订阅上游视频服务
     if let Some(video_svc) = crate::sos_config::VIDEO_SVC.get() {
         librustdesk::service::Service::on_unsubscribe(video_svc, conn_id);
-        log::info!("Unsubscribed from upstream video service (conn #{})", conn_id);
+        log::info!(
+            "Unsubscribed from upstream video service (conn #{})",
+            conn_id
+        );
     }
 
     // 移除 cliprdr 通道
@@ -561,18 +603,23 @@ async fn run_service_loop(mut stream: Stream, _config: SosConfig) -> ResultType<
     log::info!("Removed cliprdr channel for conn #{}", conn_id);
 
     // 通知 QoS 系统连接已关闭
-    librustdesk::video_service::VIDEO_QOS.lock().unwrap().on_connection_close(conn_id);
+    librustdesk::video_service::VIDEO_QOS
+        .lock()
+        .unwrap()
+        .on_connection_close(conn_id);
+
+    // 恢复控制端改过的分辨率
+    librustdesk::server::display_service::restore_resolutions();
 
     Ok(())
 }
 
 /// 文件传输专用循环（不启动视频/剪贴板服务）
-async fn run_file_transfer_loop(
-    mut stream: Stream,
-) -> ResultType<()> {
+async fn run_file_transfer_loop(mut stream: Stream) -> ResultType<()> {
     use tokio::time::{sleep, Duration};
 
-    let (ft_tx, mut ft_rx) = tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
+    let (ft_tx, mut ft_rx) =
+        tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
     let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new(ft_tx);
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(10));
 
@@ -650,12 +697,14 @@ async fn handle_incoming_message(
     // 调试日志：打印键盘事件类型（用于排查 IME 问题）
     if msg.has_key_event() {
         let ke = msg.key_event();
-        log::trace!("[IME_DEBUG] KeyEvent down={} CtrlKey={} Chr={} Uni={} Seq(len={})",
+        log::trace!(
+            "[IME_DEBUG] KeyEvent down={} CtrlKey={} Chr={} Uni={} Seq(len={})",
             ke.down,
             ke.has_control_key(),
             ke.has_chr(),
             ke.has_unicode(),
-            if ke.has_seq() { ke.seq().len() } else { 0 });
+            if ke.has_seq() { ke.seq().len() } else { 0 }
+        );
     }
 
     if log::log_enabled!(log::Level::Trace) {
@@ -697,7 +746,8 @@ async fn handle_incoming_message(
         {
             if let Some(clip) = librustdesk::clipboard_file::msg_2_clip(msg.cliprdr().clone()) {
                 let _ = clipboard::ContextSend::proc(|context| {
-                    context.server_clip_file(conn_id, clip)
+                    context
+                        .server_clip_file(conn_id, clip)
                         .map_err(|e| e.into())
                 });
             }
@@ -711,7 +761,10 @@ async fn handle_incoming_message(
             log::info!("[IME_DEBUG] Misc::Option fps={}", misc.option().custom_fps);
         }
         if misc.has_switch_display() {
-            log::info!("[IME_DEBUG] Misc::SwitchDisplay display={}", misc.switch_display().display);
+            log::info!(
+                "[IME_DEBUG] Misc::SwitchDisplay display={}",
+                misc.switch_display().display
+            );
         }
         if misc.has_video_received() {
             log::trace!("[IME_DEBUG] Misc::VideoReceived");
@@ -724,7 +777,9 @@ async fn handle_incoming_message(
         if misc.has_option() {
             let opt = misc.option();
             if opt.custom_fps > 0 {
-                librustdesk::video_service::VIDEO_QOS.lock().unwrap()
+                librustdesk::video_service::VIDEO_QOS
+                    .lock()
+                    .unwrap()
                     .user_custom_fps(conn_id, opt.custom_fps as _);
             }
             if let Ok(q) = opt.image_quality.enum_value() {
@@ -739,13 +794,14 @@ async fn handle_incoming_message(
                     _ => q as i32,
                 };
                 if v > 0 {
-                    librustdesk::video_service::VIDEO_QOS.lock().unwrap()
+                    librustdesk::video_service::VIDEO_QOS
+                        .lock()
+                        .unwrap()
                         .user_image_quality(conn_id, v);
                 }
             }
             if let Some(sd) = opt.supported_decoding.clone().take() {
-                scrap::codec::Encoder::update(
-                    scrap::codec::EncodingUpdate::Update(conn_id, sd));
+                scrap::codec::Encoder::update(scrap::codec::EncodingUpdate::Update(conn_id, sd));
             }
         }
         // 显示器切换请求
@@ -753,6 +809,19 @@ async fn handle_incoming_message(
             let sd = misc.switch_display();
             let idx = sd.display as usize;
             log::info!("Switch display requested: #{}", idx);
+        }
+        // 分辨率变更请求（ChangeResolution 已废弃但仍需兼容；ChangeDisplayResolution 1.2.4+）
+        if misc.has_change_resolution() {
+            let r = misc.change_resolution();
+            handle_change_resolution(None, r.width as usize, r.height as usize);
+        }
+        if misc.has_change_display_resolution() {
+            let dr = misc.change_display_resolution();
+            handle_change_resolution(
+                Some(dr.display as usize),
+                dr.resolution.width as usize,
+                dr.resolution.height as usize,
+            );
         }
     } else if msg.has_file_action() {
         file_transfer.handle_action(msg.file_action());
@@ -765,11 +834,20 @@ async fn handle_incoming_message(
                 file_transfer.handle_data(block).await;
             }
             Some(file_response::Union::Done(ref d)) => {
-                log::info!("[FT] File transfer done: id={} file_num={}", d.id, d.file_num);
+                log::info!(
+                    "[FT] File transfer done: id={} file_num={}",
+                    d.id,
+                    d.file_num
+                );
                 file_transfer.handle_done(d.id, d.file_num);
             }
             Some(file_response::Union::Error(ref e)) => {
-                log::info!("[FT] File transfer error: id={} file_num={} error={}", e.id, e.file_num, e.error);
+                log::info!(
+                    "[FT] File transfer error: id={} file_num={} error={}",
+                    e.id,
+                    e.file_num,
+                    e.error
+                );
                 file_transfer.handle_error(e.id);
             }
             Some(file_response::Union::Digest(ref d)) => {
@@ -786,6 +864,43 @@ async fn handle_incoming_message(
     }
 
     Ok(())
+}
+
+/// 处理分辨率变更请求（来自控制端的 Misc::ChangeResolution / ChangeDisplayResolution）
+fn handle_change_resolution(display_idx: Option<usize>, width: usize, height: usize) {
+    log::info!(
+        "Change resolution requested: display={:?}, {}x{}",
+        display_idx,
+        width,
+        height
+    );
+    match librustdesk::server::display_service::try_get_displays() {
+        Ok(displays) => {
+            let idx = display_idx.unwrap_or(0);
+            if let Some(display) = displays.get(idx) {
+                let name = display.name();
+                // 保存原始分辨率，以便控制端断开后恢复
+                let original = (display.width() as i32, display.height() as i32);
+                librustdesk::server::display_service::set_last_changed_resolution(
+                    &name,
+                    original,
+                    (width as i32, height as i32),
+                );
+                if let Err(e) = librustdesk::platform::change_resolution(&name, width, height) {
+                    log::error!(
+                        "Failed to change resolution '{}' to {}x{}: {:?}",
+                        name,
+                        width,
+                        height,
+                        e
+                    );
+                }
+            } else {
+                log::warn!("Display #{} not found", idx);
+            }
+        }
+        Err(e) => log::warn!("Failed to enumerate displays: {}", e),
+    }
 }
 
 /// 打印消息的所有 union 类型（用于调试客户端发送了什么）

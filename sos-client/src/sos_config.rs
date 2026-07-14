@@ -29,17 +29,15 @@ pub fn set_current_password(pwd: String) {
     if let Ok(mut g) = lock.lock() {
         *g = pwd;
     }
+    // 通知托盘刷新 tooltip（事件驱动，零轮询开销）
+    crate::sos_tray::notify_password_changed();
 }
 
 /// 生成随机临时密码（8 位字母数字）
 pub fn generate_temp_password() -> String {
     use hbb_common::rand::Rng;
     (0..6)
-        .map(|_| {
-            hbb_common::rand::thread_rng()
-                .gen_range(0..10)
-                .to_string()
-        })
+        .map(|_| hbb_common::rand::thread_rng().gen_range(0..10).to_string())
         .collect()
 }
 
@@ -186,8 +184,10 @@ impl RegistryConfig {
         // 生成新的随机盐值
         use hbb_common::rand::Rng;
         let salt: String = (0..12)
-            .map(|_| hbb_common::rand::thread_rng()
-                .sample(hbb_common::rand::distributions::Alphanumeric) as char)
+            .map(|_| {
+                hbb_common::rand::thread_rng().sample(hbb_common::rand::distributions::Alphanumeric)
+                    as char
+            })
             .collect();
         if let Ok(key) = Self::open_key() {
             let _ = key.set_value("Salt", &salt);
@@ -201,8 +201,7 @@ impl RegistryConfig {
     pub fn get_option(key: &str) -> String {
         let sub_path = format!("{}\\Options", sos_constants::REGISTRY_PATH);
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-        hklm
-            .open_subkey(&sub_path)
+        hklm.open_subkey(&sub_path)
             .and_then(|k| k.get_value(key))
             .unwrap_or_default()
     }
@@ -221,8 +220,13 @@ impl RegistryConfig {
     /// 清理旧版遗留的注册表键（SOS 现仅存设备 ID，其余均内存管理）
     pub fn clean_legacy_keys() {
         const LEGACY_KEYS: &[&str] = &[
-            "KeyPair", "Password", "TemporaryPassword",
-            "RendezvousServer", "KeyConfirmed", "EncID", "NatType",
+            "KeyPair",
+            "Password",
+            "TemporaryPassword",
+            "RendezvousServer",
+            "KeyConfirmed",
+            "EncID",
+            "NatType",
         ];
         if let Ok(key) = Self::open_key() {
             for k in LEGACY_KEYS {
@@ -295,8 +299,8 @@ pub struct SosConfig {
     pub rendezvous_server: String,
     pub relay_server: String,
     pub key_pair: (Vec<u8>, Vec<u8>), // (sk, pk)
-    pub password: String,              // CLI 传入的临时密码
-    pub server_pub_key: String,        // 信令服务器公钥（Base64）
+    pub password: String,             // CLI 传入的临时密码
+    pub server_pub_key: String,       // 信令服务器公钥（Base64）
 }
 
 impl SosConfig {
