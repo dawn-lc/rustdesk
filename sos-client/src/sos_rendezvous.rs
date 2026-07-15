@@ -20,7 +20,7 @@ use std::time::Instant;
 /// `password_refresh_tx`：连接断开后通知主进程刷新临时密码
 pub async fn run(
     mut config: SosConfig,
-    _tray_tx: std::sync::mpsc::Sender<crate::sos_tray::TrayCommand>,
+    _tray_tx: tokio::sync::mpsc::UnboundedSender<crate::sos_tray::TrayCommand>,
     password_refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> ResultType<()> {
     let host = check_port(

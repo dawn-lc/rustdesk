@@ -868,16 +868,25 @@ async fn handle_incoming_message(
 
 /// 处理分辨率变更请求（来自控制端的 Misc::ChangeResolution / ChangeDisplayResolution）
 fn handle_change_resolution(display_idx: Option<usize>, width: usize, height: usize) {
-    log::info!(
-        "Change resolution requested: display={:?}, {}x{}",
-        display_idx,
-        width,
-        height
-    );
     match librustdesk::server::display_service::try_get_displays() {
         Ok(displays) => {
             let idx = display_idx.unwrap_or(0);
             if let Some(display) = displays.get(idx) {
+                let cur_w = display.width() as usize;
+                let cur_h = display.height() as usize;
+                // 请求的分辨率与当前一致 → 跳过（控制端可能在连接握手时发送了兼容字段）
+                if width == cur_w && height == cur_h {
+                    log::debug!("Change resolution skipped: already {}x{}", width, height);
+                    return;
+                }
+                log::info!(
+                    "Change resolution requested: display={:?}, {}x{} (current: {}x{})",
+                    display_idx,
+                    width,
+                    height,
+                    cur_w,
+                    cur_h,
+                );
                 let name = display.name();
                 // 保存原始分辨率，以便控制端断开后恢复
                 let original = (display.width() as i32, display.height() as i32);
@@ -886,15 +895,24 @@ fn handle_change_resolution(display_idx: Option<usize>, width: usize, height: us
                     original,
                     (width as i32, height as i32),
                 );
-                if let Err(e) = librustdesk::platform::change_resolution(&name, width, height) {
-                    log::error!(
-                        "Failed to change resolution '{}' to {}x{}: {:?}",
-                        name,
-                        width,
-                        height,
-                        e
-                    );
+                // 通知 video_service 用新分辨率重建编码器
+                if let Some(vs) = crate::sos_config::VIDEO_SVC.get() {
+                    vs.set_option_bool(librustdesk::video_service::OPTION_REFRESH, true);
                 }
+                // 分辨率切换放在独立线程，避免阻塞当前 Tokio 任务
+                // （video_service 的 src_stride 错误会自动恢复，无需手动等待）
+                let name = name.to_string();
+                std::thread::spawn(move || {
+                    if let Err(e) = librustdesk::platform::change_resolution(&name, width, height) {
+                        log::error!(
+                            "Failed to change resolution '{}' to {}x{}: {:?}",
+                            name,
+                            width,
+                            height,
+                            e
+                        );
+                    }
+                });
             } else {
                 log::warn!("Display #{} not found", idx);
             }

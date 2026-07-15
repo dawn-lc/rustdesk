@@ -5,7 +5,7 @@
 
 #![allow(non_snake_case)]
 
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 
 /// 托盘命令枚举
 #[derive(Debug, Clone)]
@@ -20,7 +20,7 @@ pub enum TrayCommand {
 mod win32_impl {
     use super::TrayCommand;
     use hbb_common::ResultType;
-    use std::sync::mpsc;
+    use tokio::sync::mpsc;
     use windows::Win32::Foundation::*;
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::System::DataExchange::*;
@@ -43,16 +43,16 @@ mod win32_impl {
     const MENU_EXIT: u16 = 6;
 
     struct TrayState {
-        tx: mpsc::Sender<TrayCommand>,
+        tx: mpsc::UnboundedSender<TrayCommand>,
     }
 
-    /// 实时获取设备 ID（托盘不再缓存，每次从注册表读取以确保 ID 变更后同步）
+    /// 获取设备 ID（从注册表实时读取，支持 UUID_MISMATCH 后变更）
     fn get_device_id() -> String {
         crate::sos_config::RegistryConfig::get_id()
     }
 
     /// 更新托盘提示文字（只刷新文字，不碰图标）
-    pub fn run(tx: mpsc::Sender<TrayCommand>) -> ResultType<()> {
+    pub fn run(tx: mpsc::UnboundedSender<TrayCommand>) -> ResultType<()> {
         // 注册窗口类
         let class_name: Vec<u16> = "RustDeskSOS_Tray\0".encode_utf16().collect();
         let hinstance = unsafe { GetModuleHandleW(None)?.into() };
@@ -165,7 +165,9 @@ mod win32_impl {
                 WM_RBUTTONUP => {
                     // 右键菜单前先刷新提示文字
                     update_tip(hwnd);
-                    show_context_menu(hwnd);
+                    // 复用刚刷新的 ID 构造菜单，避免重复读注册表
+                    let device_id = get_device_id();
+                    show_context_menu(hwnd, &device_id);
                 }
                 WM_LBUTTONDBLCLK => {
                     let _ = state.tx.send(TrayCommand::ShowInfo);
@@ -240,9 +242,9 @@ mod win32_impl {
         }
     }
 
-    unsafe fn show_context_menu(hwnd: HWND) {
+    unsafe fn show_context_menu(hwnd: HWND, device_id: &str) {
         if let Ok(menu) = CreatePopupMenu() {
-            let id_text = format!("ID: {}\0", get_device_id());
+            let id_text = format!("ID: {}\0", device_id);
             let id_wide: Vec<u16> = id_text.encode_utf16().collect();
             let _ = AppendMenuW(
                 menu,
@@ -327,7 +329,7 @@ pub fn notify_password_changed() {}
 
 /// 公开的托盘入口（非 Windows 平台提供空实现）
 #[cfg(not(windows))]
-pub fn run(_tx: mpsc::Sender<TrayCommand>) -> hbb_common::ResultType<()> {
+pub fn run(_tx: mpsc::UnboundedSender<TrayCommand>) -> hbb_common::ResultType<()> {
     log::warn!("System tray is only supported on Windows");
     // 阻塞以保持兼容接口
     std::thread::park();
@@ -336,6 +338,6 @@ pub fn run(_tx: mpsc::Sender<TrayCommand>) -> hbb_common::ResultType<()> {
 
 /// 公开的托盘入口
 #[cfg(windows)]
-pub fn run(tx: mpsc::Sender<TrayCommand>) -> hbb_common::ResultType<()> {
+pub fn run(tx: mpsc::UnboundedSender<TrayCommand>) -> hbb_common::ResultType<()> {
     win32_impl::run(tx)
 }

@@ -34,6 +34,21 @@ pub fn run(shmem_name: &str, active: Arc<AtomicBool>) {
         return;
     }
 
+    // 打开命名自动重置事件：写完首帧后 SetEvent，主进程 WaitForSingleObject 被唤醒
+    let ready_event = {
+        let name_wide: Vec<u16> = crate::sos_constants::CAPTURE_READY_EVENT
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            extern "system" {
+                fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
+            }
+            const EVENT_MODIFY_STATE: u32 = 0x0002;
+            OpenEventW(EVENT_MODIFY_STATE, 0, name_wide.as_ptr())
+        }
+    };
+
     let mut displays = match scrap::Display::all() {
         Ok(d) => d,
         Err(e) => { log::error!("[CAP] Failed to enumerate displays: {}", e); return; }
@@ -96,7 +111,19 @@ pub fn run(shmem_name: &str, active: Arc<AtomicBool>) {
                         let old = *(ptr as *const i32);
                         std::ptr::write_volatile(ptr as *mut i32, if old == i32::MAX { 0 } else { old + 1 });
                     }
-                    if first { log::info!("[CAP] First frame written, len={}", len); first = false; }
+                    if first {
+                        log::info!("[CAP] First frame written, len={}", len);
+                        first = false;
+                        // 通知主进程：首帧就绪，可以注入 SHMEM 工厂
+                        if ready_event != 0 {
+                            unsafe {
+                                extern "system" {
+                                    fn SetEvent(h: isize) -> i32;
+                                }
+                                SetEvent(ready_event);
+                            }
+                        }
+                    }
                     frame_count += 1;
                     cap_err_count = 0;
                     if last_heartbeat.elapsed().as_secs() >= 5 {

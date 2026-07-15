@@ -67,9 +67,10 @@ impl SosShmem {
     }
 
     fn flink(name: &str) -> String {
-        let dir = std::path::PathBuf::from("C:\\ProgramData\\RustDesk")
-            .join(Self::SHMEM_DIR);
-        dir.join(format!("shmem{}", name)).to_string_lossy().to_string()
+        let dir = std::path::PathBuf::from("C:\\ProgramData\\RustDesk").join(Self::SHMEM_DIR);
+        dir.join(format!("shmem{}", name))
+            .to_string_lossy()
+            .to_string()
     }
 }
 
@@ -81,20 +82,20 @@ static SHMEM_STATE: std::sync::Mutex<Option<(SosShmem, usize, usize)>> =
 // (shmem, width, height)
 
 /// 标记 factory 是否有效：清除时设为 false，capturer 检测到此标志会返回错误触发 video_service 重启
-static SHMEM_FACTORY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHMEM_FACTORY_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 注入 SHMEM 状态并注册自定义捕获器工厂到 video_service。
 /// 首次调用时存储 `SosShmem`（持有所有权），后续调用复用已有映射。
-pub fn register_shmem_and_factory(
-    shmem: SosShmem,
-    width: usize,
-    height: usize,
-) {
+pub fn register_shmem_and_factory(shmem: SosShmem, width: usize, height: usize) {
     let ptr = shmem.as_ptr() as usize;
     let len = shmem.len();
     log::info!(
         "[register_shmem_and_factory] ptr=0x{:x} len={} w={} h={}",
-        ptr, len, width, height
+        ptr,
+        len,
+        width,
+        height
     );
 
     let mut state = SHMEM_STATE.lock().unwrap();
@@ -107,15 +108,18 @@ pub fn register_shmem_and_factory(
     // 先清除再设置（确保动态切换生效）
     librustdesk::video_service::clear_custom_capturer_factory();
     SHMEM_FACTORY_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    librustdesk::video_service::set_custom_capturer_factory(
-        Box::new(|_current, _display, _running| {
+    librustdesk::video_service::set_custom_capturer_factory(Box::new(
+        |_current, _display, _running| {
             let state = SHMEM_STATE.lock().unwrap();
             let (ref shmem, w, h) = state.as_ref().expect("SHMEM_STATE not set");
             Ok(Box::new(SosShmemCapturer::new(
-                shmem.as_ptr(), shmem.len(), *w, *h,
+                shmem.as_ptr(),
+                shmem.len(),
+                *w,
+                *h,
             )))
-        }),
-    );
+        },
+    ));
 }
 
 /// 清除 SHMEM 状态和工厂（进程退出时调用，释放共享内存）
@@ -147,7 +151,9 @@ pub fn create_shmem() -> hbb_common::ResultType<SosShmem> {
         let w = d.width() as usize;
         let h = d.height() as usize;
         let pixel = ((w + ALIGN - 1) / ALIGN * ALIGN) * ((h + ALIGN - 1) / ALIGN * ALIGN);
-        if pixel > max_pixel { max_pixel = pixel; }
+        if pixel > max_pixel {
+            max_pixel = pixel;
+        }
     }
     let shmem_size = (ADDR_FRAME + max_pixel * 4 + ALIGN - 1) / ALIGN * ALIGN;
 
@@ -173,9 +179,13 @@ unsafe impl Send for SosShmemCapturer {}
 unsafe impl Sync for SosShmemCapturer {}
 
 impl SosShmemCapturer {
-
     pub fn new(ptr: *const u8, len: usize, width: usize, height: usize) -> Self {
-        Self { shmem_ptr: ptr, shmem_len: len, width, height }
+        Self {
+            shmem_ptr: ptr,
+            shmem_len: len,
+            width,
+            height,
+        }
     }
 
     fn read_counter(&self) -> i32 {
@@ -233,7 +243,10 @@ impl scrap::TraitCapturer for SosShmemCapturer {
 
         // 检查 factory 是否已被清除（UAC 退出），是则返回错误触发 video_service 重启
         if !SHMEM_FACTORY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "shmem factory cleared"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "shmem factory cleared",
+            ));
         }
 
         let wcnt = self.read_counter();
@@ -245,7 +258,11 @@ impl scrap::TraitCapturer for SosShmemCapturer {
             let (len, w, h) = self.read_frame_info();
             log::debug!(
                 "[SosShmemCapturer::frame] NEW wcnt={} ecnt={} len={} w={} h={}",
-                wcnt, ecnt, len, w, h
+                wcnt,
+                ecnt,
+                len,
+                w,
+                h
             );
             if len > 0 && len <= self.shmem_len.saturating_sub(SHMEM_ADDR_CAPTURE_FRAME) {
                 self.update_counter_echo();
@@ -260,14 +277,25 @@ impl scrap::TraitCapturer for SosShmemCapturer {
         if n % 200 == 0 {
             log::debug!(
                 "[SosShmemCapturer::frame] NOFRAME n={} wcnt={} ecnt={} wb={} has_new={}",
-                n, wcnt, ecnt, wb, has_new
+                n,
+                wcnt,
+                ecnt,
+                wb,
+                has_new
             );
         }
 
         // 没有新帧时统一返回 WouldBlock，让上游主循环重试而非重启服务
-        Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "shmem wouldblock"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "shmem wouldblock",
+        ))
     }
 
-    fn is_gdi(&self) -> bool { true }
-    fn set_gdi(&mut self) -> bool { true }
+    fn is_gdi(&self) -> bool {
+        true
+    }
+    fn set_gdi(&mut self) -> bool {
+        true
+    }
 }

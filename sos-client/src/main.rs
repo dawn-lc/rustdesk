@@ -30,7 +30,6 @@ mod sos_tray;
 use clap::Parser;
 use hbb_common::ResultType;
 use std::io::Write;
-use std::sync::mpsc;
 
 /// RustDesk SOS 精简受控端
 #[derive(Parser)]
@@ -201,63 +200,85 @@ async fn main() -> ResultType<()> {
     };
 
     // 创建输入管道服务器（Main → System 输入事件）
-    let (pipe_tx, pipe_thread) =
+    let (pipe_tx, _) =
         sos_pipe::create_pipe_server(sos_constants::INPUT_PIPE, sos_pipe::PIPE_ACCESS_OUTBOUND);
     crate::sos_pipe::set_down_tx(pipe_tx);
 
-    // 创建控制管道服务器（Main → System 启停捕获，独立管道）
-    let (ctrl_tx, ctrl_thread) =
-        sos_pipe::create_pipe_server(sos_constants::CONTROL_PIPE, sos_pipe::PIPE_ACCESS_OUTBOUND);
-    crate::sos_pipe::set_control_tx(ctrl_tx);
+    // 创建捕获启停命名事件（替代原 CONTROL_PIPE，统一为内核事件模型）
+    let (capture_start_event, capture_stop_event) = unsafe {
+        extern "system" {
+            fn CreateEventW(sa: *const u8, manual: i32, initial: i32, name: *const u16) -> isize;
+        }
+        let to_wide = |s: &str| {
+            s.encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let start = CreateEventW(
+            std::ptr::null(),
+            0,
+            0,
+            to_wide(sos_constants::CAPTURE_START_EVENT).as_ptr(),
+        );
+        let stop = CreateEventW(
+            std::ptr::null(),
+            0,
+            0,
+            to_wide(sos_constants::CAPTURE_STOP_EVENT).as_ptr(),
+        );
+        (start, stop)
+    };
 
-    // 用 Arc<Mutex<Option<>>> 包装线程句柄，看门狗 join 后替换新句柄
-    let pipe_thread_ref = std::sync::Arc::new(std::sync::Mutex::new(Some(pipe_thread)));
-    let ctrl_thread_ref = std::sync::Arc::new(std::sync::Mutex::new(Some(ctrl_thread)));
-
-    // 5. 以 SYSTEM 身份启动子进程（常驻）
+    // 5. 以 SYSTEM 身份启动子进程（常驻），获取进程句柄用于看门狗
     #[cfg(windows)]
-    {
-        sos_system::launch_system_sub_process(cli.debug);
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
+    let sub_proc_handle = sos_system::launch_system_sub_process(cli.debug);
 
-    // 5a. SYSTEM 子进程存活看门狗：join 管道线程，死亡时自动重建 + 重启
+    // 5a. SYSTEM 子进程存活看门狗：基于进程句柄的 WaitForSingleObject 监控
+    //     零轮询、零心跳 — 纯事件驱动。子进程死亡时自动重建管道 + 重启子进程。
     #[cfg(windows)]
-    {
+    if sub_proc_handle != 0 {
         let debug = cli.debug;
-        let ptr = pipe_thread_ref.clone();
-        let ctr = ctrl_thread_ref.clone();
-        std::thread::spawn(move || loop {
-            // 阻塞等待管道线程退出（子进程死亡时 OS 关闭管道 → 线程退出 → join 返回）
-            // 用 ctrl_thread 作为代表：子进程一死，两个管道同时断开
-            let old_ctrl = ctr.lock().unwrap().take().unwrap();
-            let _ = old_ctrl.join();
-            log::warn!("SYSTEM sub-process pipe broken (ctrl_thread exited), restarting...");
-
-            // 重建管道，更新全局 sender
-            let (pt, pth) = sos_pipe::create_pipe_server(
-                sos_constants::INPUT_PIPE,
-                sos_pipe::PIPE_ACCESS_OUTBOUND,
-            );
-            let (ct, cth) = sos_pipe::create_pipe_server(
-                sos_constants::CONTROL_PIPE,
-                sos_pipe::PIPE_ACCESS_OUTBOUND,
-            );
-            sos_pipe::set_down_tx(pt);
-            sos_pipe::set_control_tx(ct);
-
-            // 同步清理可能还活着的旧 pipe_thread（子进程死亡后它也已退出或即将退出）
-            if let Some(old_pipe) = ptr.lock().unwrap().take() {
-                let _ = old_pipe.join();
+        std::thread::spawn(move || {
+            // FFI 声明（看门狗专用，避免引入额外 crate 依赖）
+            extern "system" {
+                fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+                fn CloseHandle(h: isize) -> i32;
             }
+            const INFINITE: u32 = 0xFFFFFFFF;
+            const WAIT_OBJECT_0: u32 = 0;
 
-            // 放入新句柄供下一轮 join
-            *ptr.lock().unwrap() = Some(pth);
-            *ctr.lock().unwrap() = Some(cth);
+            let mut current_handle = sub_proc_handle;
+            loop {
+                log::info!(
+                    "Watchdog: waiting on sub-process handle 0x{:x}",
+                    current_handle
+                );
+                let ret = unsafe { WaitForSingleObject(current_handle, INFINITE) };
+                if ret != WAIT_OBJECT_0 {
+                    log::error!("Watchdog: WaitForSingleObject failed, ret={}", ret);
+                    break;
+                }
+                unsafe {
+                    CloseHandle(current_handle);
+                }
+                log::warn!("SYSTEM sub-process exited, restarting...");
 
-            // 启动新的 SYSTEM 子进程
-            sos_system::launch_system_sub_process(debug);
-            std::thread::sleep(std::time::Duration::from_secs(3));
+                // 重建输入管道
+                let (pt, _) = sos_pipe::create_pipe_server(
+                    sos_constants::INPUT_PIPE,
+                    sos_pipe::PIPE_ACCESS_OUTBOUND,
+                );
+                sos_pipe::set_down_tx(pt);
+
+                // 启动新的 SYSTEM 子进程
+                let new_handle = sos_system::launch_system_sub_process(debug);
+                if new_handle == 0 {
+                    log::error!("Watchdog: failed to restart sub-process, exiting");
+                    break;
+                }
+                current_handle = new_handle;
+            }
+            log::warn!("Watchdog: exited");
         });
     }
 
@@ -268,7 +289,8 @@ async fn main() -> ResultType<()> {
     sos_config::set_video_service(video_svc);
     log::info!("Video service started (upstream)");
 
-    // 6a. UAC 监控：检测到安全桌面时注入自定义工厂
+    // 6a. UAC 监控：SosWaitForDesktopSwitch 内部封装 SetWinEventHook + 消息泵
+    //     调用线程阻塞等待桌面切换，零轮询、零 sleep。
     #[cfg(windows)]
     {
         let uac_w = {
@@ -276,46 +298,77 @@ async fn main() -> ResultType<()> {
                 .unwrap_or_default()
                 .first()
                 .map(|d| d.width() as usize)
-                .unwrap_or(1920)
+                .unwrap_or(1280)
         };
         let uac_h = {
             scrap::Display::all()
                 .unwrap_or_default()
                 .first()
                 .map(|d| d.height() as usize)
-                .unwrap_or(1080)
+                .unwrap_or(720)
         };
-        std::thread::spawn(move || loop {
-            let uac = librustdesk::platform::windows::is_process_consent_running().unwrap_or(false);
-            let has_factory = librustdesk::video_service::custom_capturer_factory_is_set();
-            if uac && !has_factory {
-                // UAC 安全桌面激活 → 先发信号让 SYSTEM 子进程启动 GDI 捕获
-                log::info!("[UAC] consent.exe detected, sending START_CAPTURE via control pipe");
-                sos_pipe::try_send_control(
-                    sos_constants::MSG_CONTROL_START_CAPTURE
-                        .to_ne_bytes()
-                        .to_vec(),
-                );
-                // 短暂等待捕获线程启动并产出首帧（~33ms per frame + setup）
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                // 再注入 SHMEM 工厂让 video_service 切换捕获源
-                if let Ok(shmem) = sos_shmem::SosShmem::open_existing(sos_shmem::SHMEM_NAME) {
-                    sos_shmem::register_shmem_and_factory(shmem, uac_w, uac_h);
-                    log::info!("[UAC] Factory injected, video_service will switch to SOS SHMEM");
-                }
-            } else if !uac && has_factory {
-                // UAC 安全桌面关闭 → 先清除工厂让 video_service 切回 DXGI
-                sos_shmem::clear_shmem_factory();
-                log::info!("[UAC] Factory cleared, video_service will switch back to DXGI");
-                // 再通过控制管道发信号让 SYSTEM 子进程停止 GDI 捕获
-                log::info!("[UAC] Sending STOP_CAPTURE via control pipe");
-                sos_pipe::try_send_control(
-                    sos_constants::MSG_CONTROL_STOP_CAPTURE
-                        .to_ne_bytes()
-                        .to_vec(),
-                );
+
+        // 创建命名自动重置事件：捕获线程写完首帧后 SetEvent
+        let event_name_wide: Vec<u16> = sos_constants::CAPTURE_READY_EVENT
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ready_event = unsafe {
+            extern "system" {
+                fn CreateEventW(
+                    sa: *const u8,
+                    manual: i32,
+                    initial: i32,
+                    name: *const u16,
+                ) -> isize;
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            CreateEventW(std::ptr::null(), 0, 0, event_name_wide.as_ptr())
+        };
+
+        std::thread::spawn(move || {
+            extern "system" {
+                fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+                fn SetEvent(h: isize) -> i32;
+            }
+            const WAIT_OBJECT_0: u32 = 0;
+            const INFINITE: u32 = 0xFFFFFFFF;
+
+            let mut was_uac =
+                librustdesk::platform::windows::is_process_consent_running().unwrap_or(false);
+
+            loop {
+                // 阻塞等待桌面切换（C++ 消息泵 + SetWinEventHook，零 CPU）
+                unsafe { sos_system::SosWaitForDesktopSwitch(INFINITE) };
+
+                let uac =
+                    librustdesk::platform::windows::is_process_consent_running().unwrap_or(false);
+                let has_factory = librustdesk::video_service::custom_capturer_factory_is_set();
+
+                if uac && !was_uac {
+                    log::info!("[UAC] Secure desktop activated → SetEvent(CAPTURE_START)");
+                    was_uac = true;
+                    if !has_factory {
+                        unsafe { SetEvent(capture_start_event) };
+                        let ret = unsafe { WaitForSingleObject(ready_event, 150) };
+                        if ret != WAIT_OBJECT_0 {
+                            log::warn!("[UAC] Timed out waiting for capture ready (ret={})", ret);
+                        }
+                        if let Ok(shmem) = sos_shmem::SosShmem::open_existing(sos_shmem::SHMEM_NAME)
+                        {
+                            sos_shmem::register_shmem_and_factory(shmem, uac_w, uac_h);
+                            log::info!("[UAC] Factory injected → SOS SHMEM");
+                        }
+                    }
+                } else if !uac && was_uac {
+                    log::info!("[UAC] Secure desktop closed → SetEvent(CAPTURE_STOP)");
+                    was_uac = false;
+                    if has_factory {
+                        sos_shmem::clear_shmem_factory();
+                        log::info!("[UAC] Factory cleared → back to DXGI");
+                        unsafe { SetEvent(capture_stop_event) };
+                    }
+                }
+            }
         });
     }
 
@@ -337,8 +390,8 @@ async fn main() -> ResultType<()> {
         }
     }
 
-    // 6. 创建托盘
-    let (tray_tx, tray_rx) = mpsc::channel::<sos_tray::TrayCommand>();
+    // 6. 创建托盘（tokio unbounded channel，支持异步 recv，无需轮询）
+    let (tray_tx, mut tray_rx) = tokio::sync::mpsc::unbounded_channel::<sos_tray::TrayCommand>();
     let tray_tx_for_rendezvous = tray_tx.clone();
     std::thread::spawn(move || {
         if let Err(e) = sos_tray::run(tray_tx) {
@@ -365,8 +418,6 @@ async fn main() -> ResultType<()> {
     );
 
     // 9. 主事件循环：接受托盘命令 + 密码刷新通知 + 保持运行
-    use std::sync::Mutex;
-    let tray_rx = std::sync::Arc::new(Mutex::new(tray_rx));
     loop {
         tokio::select! {
             // 密码刷新通知：连接断开后重新生成临时密码（仅当未通过 --password 固定时生效）
@@ -380,11 +431,10 @@ async fn main() -> ResultType<()> {
                 }
             }
 
-            // 托盘命令（每 1 秒轮询）
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                let cmd = tray_rx.lock().unwrap().recv_timeout(std::time::Duration::from_millis(10));
+            // 托盘命令（事件驱动，零轮询）
+            cmd = tray_rx.recv() => {
                 match cmd {
-                    Ok(sos_tray::TrayCommand::Exit) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Some(sos_tray::TrayCommand::Exit) | None => {
                         log::info!("Exit requested via tray");
                         break;
                     }
