@@ -127,7 +127,11 @@ async fn main() -> ResultType<()> {
     let log_level = if cli.debug { "info" } else { "warn" };
     // 初始化日志（所有模式都需要）
     if cli.service {
-        sos_bootstrap::init_system_logger(log_level);
+        if cli.debug {
+            sos_bootstrap::init_system_logger(log_level);
+        } else {
+            sos_bootstrap::init_logger(log_level);
+        }
     } else {
         sos_bootstrap::init_logger(log_level);
     }
