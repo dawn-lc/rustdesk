@@ -122,11 +122,6 @@ pub fn register_shmem_and_factory(shmem: SosShmem, width: usize, height: usize) 
     ));
 }
 
-/// 清除 SHMEM 状态和工厂（进程退出时调用，释放共享内存）
-pub fn clear_shmem_state() {
-    *SHMEM_STATE.lock().unwrap() = None;
-}
-
 /// 清除工厂并标记 SHMEM 无效（UAC 退出时调用）
 /// capturer 检测到此标志会返回错误，触发 video_service 重启回 DXGI
 pub fn clear_shmem_factory() {
@@ -171,8 +166,8 @@ pub fn create_shmem() -> hbb_common::ResultType<SosShmem> {
 pub struct SosShmemCapturer {
     shmem_ptr: *const u8,
     shmem_len: usize,
-    width: usize,
-    height: usize,
+    _width: usize,
+    _height: usize,
 }
 
 unsafe impl Send for SosShmemCapturer {}
@@ -183,8 +178,8 @@ impl SosShmemCapturer {
         Self {
             shmem_ptr: ptr,
             shmem_len: len,
-            width,
-            height,
+            _width: width,
+            _height: height,
         }
     }
 
@@ -208,10 +203,6 @@ impl SosShmemCapturer {
             let rptr = wptr.add(4);
             std::ptr::copy_nonoverlapping(wptr, rptr as *mut _, 4);
         }
-    }
-
-    fn has_new_frame(&self) -> bool {
-        self.read_counter() != self.read_counter_echo()
     }
 
     fn is_wouldblock(&self) -> bool {

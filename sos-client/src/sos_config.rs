@@ -93,10 +93,6 @@ impl RegistryConfig {
         hex::decode(&s).map_err(|e| anyhow::anyhow!("Failed to decode hex value: {}", e))
     }
 
-    pub fn set_binary(name: &str, value: &[u8]) -> ResultType<()> {
-        Self::set_string(name, &hex::encode(value))
-    }
-
     #[allow(dead_code)]
     pub fn get_dword(name: &str, default: u32) -> u32 {
         Self::open_key()
@@ -126,11 +122,6 @@ impl RegistryConfig {
     #[allow(dead_code)]
     pub fn get_enc_id() -> String {
         Self::get_string("EncID", "")
-    }
-
-    /// 从注册表读取持久密码（兼容旧数据，为空时使用内存密码）
-    pub fn get_password() -> String {
-        Self::get_string("Password", "")
     }
 
     /// 获取 Ed25519 密钥对：优先注册表（兼容旧数据），否则在内存中生成一份
@@ -297,7 +288,9 @@ impl RegistryConfig {
 pub struct SosConfig {
     pub id: String,
     pub rendezvous_server: String,
+    #[allow(dead_code)]
     pub relay_server: String,
+    #[allow(dead_code)]
     pub key_pair: (Vec<u8>, Vec<u8>), // (sk, pk)
     pub password: String,             // CLI 传入的临时密码
     pub server_pub_key: String,       // 信令服务器公钥（Base64）

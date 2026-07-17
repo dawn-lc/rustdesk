@@ -28,7 +28,6 @@ extern "system" {
 }
 
 pub const PIPE_ACCESS_OUTBOUND: u32 = 2;
-const PIPE_ACCESS_INBOUND: u32 = 1;
 const PIPE_TYPE_MESSAGE: u32 = 4;
 const PIPE_READMODE_MESSAGE: u32 = 2;
 const PIPE_WAIT: u32 = 0;

@@ -98,7 +98,7 @@ async fn main() -> ResultType<()> {
         unsafe {
             let has_parent = AttachConsole(ATTACH_PARENT_PROCESS).is_ok();
             if !has_parent {
-                AllocConsole();
+                let _ = AllocConsole();
             }
             // 打开控制台的输出设备，重定向 stdout/stderr
             // CreateFileW 的 dwDesiredAccess 是 u32，不能用 FILE_GENERIC_WRITE（类型不匹配）

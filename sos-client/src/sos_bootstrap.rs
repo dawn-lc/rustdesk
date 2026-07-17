@@ -71,8 +71,6 @@ pub fn init_logger(level: &str) {
 /// 初始化 SYSTEM 子进程日志（写入 exe 同目录的 rustdesk-sos-system.log）
 #[cfg(windows)]
 pub fn init_system_logger(level: &str) {
-    use std::io::Write;
-
     let level_filter = match level {
         "trace" => log::LevelFilter::Trace,
         "debug" => log::LevelFilter::Debug,

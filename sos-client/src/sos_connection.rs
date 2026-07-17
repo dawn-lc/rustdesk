@@ -683,7 +683,7 @@ async fn handle_incoming_message(
     data: hbb_common::bytes::BytesMut,
     file_transfer: &mut crate::sos_file_transfer::FileTransferHandler,
     conn_id: i32,
-    stream: &mut Stream,
+    _stream: &mut Stream,
 ) -> ResultType<()> {
     if data.is_empty() {
         return Ok(());

@@ -84,9 +84,9 @@ mod win32_impl {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                HWND::default(),
-                HMENU::default(),
-                hinstance,
+                Some(HWND::default()),
+                Some(HMENU::default()),
+                Some(hinstance),
                 None,
             )
         }?;
@@ -114,7 +114,7 @@ mod win32_impl {
             let hinst = GetModuleHandleW(None)
                 .map(|h| HINSTANCE(h.0))
                 .unwrap_or_default();
-            LoadIconW(hinst, windows::core::PCWSTR(1 as *const u16)).unwrap_or_default()
+            LoadIconW(Some(hinst), windows::core::PCWSTR(1 as *const u16)).unwrap_or_default()
         };
         nid.uFlags |= NIF_ICON;
         unsafe {
@@ -133,7 +133,7 @@ mod win32_impl {
         // 消息循环
         let mut msg = MSG::default();
         loop {
-            let result = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
+            let result = unsafe { GetMessageW(&mut msg, Some(HWND::default()), 0, 0) };
             if result.0 == 0 || result.0 == -1 {
                 break;
             }
@@ -279,8 +279,8 @@ mod win32_impl {
             let _ = GetCursorPos(&mut point);
 
             let _ = SetForegroundWindow(hwnd);
-            let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, None);
-            let _ = PostMessageW(hwnd, WM_NULL, WPARAM::default(), LPARAM::default());
+            let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, Some(0), hwnd, None);
+            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM::default(), LPARAM::default());
             let _ = DestroyMenu(menu);
         }
     }
@@ -288,7 +288,7 @@ mod win32_impl {
     fn open_clipboard_and_set_text(text: &str) -> ResultType<()> {
         let wide: Vec<u16> = format!("{}\0", text).encode_utf16().collect();
         unsafe {
-            OpenClipboard(HWND::default())?;
+            OpenClipboard(Some(HWND::default()))?;
             EmptyClipboard()?;
             let hmem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)?;
             let ptr = GlobalLock(hmem) as *mut u16;
@@ -298,7 +298,7 @@ mod win32_impl {
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             GlobalUnlock(hmem)?;
-            SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0))?;
+            SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0)))?;
             CloseClipboard()?;
         }
         Ok(())
@@ -315,7 +315,7 @@ pub fn notify_password_changed() {
     if raw != 0 {
         unsafe {
             let _ = PostMessageW(
-                HWND(raw as *mut _),
+                Some(HWND(raw as *mut _)),
                 win32_impl::WM_TRAY_UPDATE_TIP,
                 WPARAM::default(),
                 LPARAM::default(),

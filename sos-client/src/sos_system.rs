@@ -11,9 +11,6 @@ extern "C" {
     /// 返回子进程句柄（调用者负责 CloseHandle），失败返回 0。
     pub fn SosRunAsSystemInSession1(cmd: *const u16) -> isize;
 
-    /// 切换到输入桌面（最小权限版本，替代上游 selectInputDesktop 的 GENERIC_WRITE）
-    pub fn SosSwitchToInputDesktop() -> i32;
-
     /// 阻塞等待下一次桌面切换，或 dwTimeout 毫秒超时。
     /// 返回 1=桌面已切换，0=超时，-1=错误。
     /// 内部使用 SetWinEventHook(WINEVENT_INCONTEXT) + 消息泵。
@@ -221,12 +218,6 @@ pub fn run_service() -> ResultType<()> {
     let (start_event, stop_event) = unsafe {
         extern "system" {
             fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
-            fn WaitForMultipleObjects(
-                count: u32,
-                handles: *const isize,
-                wait_all: i32,
-                ms: u32,
-            ) -> u32;
         }
         const SYNCHRONIZE: u32 = 0x00100000;
         let to_wide = |s: &str| {
