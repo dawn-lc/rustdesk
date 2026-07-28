@@ -23,6 +23,9 @@ pub async fn run(
     _tray_tx: tokio::sync::mpsc::UnboundedSender<crate::sos_tray::TrayCommand>,
     password_refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> ResultType<()> {
+    log::info!("[TRACE] sos_rendezvous::run() ENTERED");
+    log::info!("[TRACE] config.id='{}' rendezvous='{}' password.len={}",
+        config.id, config.rendezvous_server, config.password.len());
     let host = check_port(
         &config.rendezvous_server,
         crate::sos_constants::RENDEZVOUS_PORT,
@@ -59,9 +62,13 @@ pub async fn run(
     let listen_timeout = std::time::Duration::from_secs(5);
     let serial = std::sync::atomic::AtomicU32::new(1);
 
+    let mut loop_count = 0u64;
     loop {
+        loop_count += 1;
+        log::info!("[TRACE] rendezvous loop iteration #{} start", loop_count);
         // 定时重新注册（心跳）
         if last_reg.elapsed() >= reg_interval {
+            log::info!("[TRACE] heartbeat due, sending RegisterPeer");
             let s = serial.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Err(e) = send_register_peer(&mut socket, &peer_addr, &config.id, s).await {
                 log::warn!("RegisterPeer heartbeat failed: {}", e);
@@ -72,20 +79,27 @@ pub async fn run(
         }
 
         // 监听信令消息
+        log::info!("[NET_DEBUG] Waiting for UDP message (timeout={}ms)...", listen_timeout.as_millis());
         match hbb_common::timeout(listen_timeout.as_millis() as u64, socket.next()).await {
             Ok(Some(Ok((bytes, _from)))) => {
-                if let Ok(rm) = RendezvousMessage::parse_from_bytes(&bytes) {
-                    if let Err(e) = handle_rendezvous_message(
-                        rm,
-                        &mut config,
-                        &mut socket,
-                        &peer_addr,
-                        &password_refresh_tx,
-                    )
-                    .await
-                    {
-                        log::warn!("Handle rendezvous message error: {}", e);
-                        // 不退出，下次循环继续
+                log::info!("[NET_DEBUG] Received {} bytes via UDP", bytes.len());
+                log::info!("[NET_DEBUG] Raw bytes hex (first 32): {}", hex::encode(&bytes[..bytes.len().min(32)]));
+                match RendezvousMessage::parse_from_bytes(&bytes) {
+                    Ok(rm) => {
+                        if let Err(e) = handle_rendezvous_message(
+                            rm,
+                            &mut config,
+                            &mut socket,
+                            &peer_addr,
+                            &password_refresh_tx,
+                        )
+                        .await
+                        {
+                            log::warn!("Handle rendezvous message error: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("[RV_DEBUG] Failed to parse rendezvous message ({} bytes): {}", bytes.len(), e);
                     }
                 }
             }
@@ -121,8 +135,10 @@ pub async fn run(
             }
             Err(_) => {
                 // 超时，正常循环
+                log::info!("[NET_DEBUG] UDP recv timeout (no data in {}ms) [TRACE]", listen_timeout.as_millis());
             }
         }
+        log::info!("[TRACE] rendezvous loop iteration #{} complete", loop_count);
     }
 }
 
@@ -152,6 +168,16 @@ async fn handle_rendezvous_message(
     peer_addr: &std::net::SocketAddr,
     password_refresh_tx: &tokio::sync::mpsc::UnboundedSender<()>,
 ) -> ResultType<()> {
+    // 记录收到的消息类型名称
+    let msg_type = match rm.union {
+        Some(rendezvous_message::Union::PunchHole(_)) => "PunchHole",
+        Some(rendezvous_message::Union::RequestRelay(_)) => "RequestRelay",
+        Some(rendezvous_message::Union::RegisterPeerResponse(_)) => "RegisterPeerResponse",
+        Some(rendezvous_message::Union::RegisterPkResponse(_)) => "RegisterPkResponse",
+        Some(rendezvous_message::Union::FetchLocalAddr(_)) => "FetchLocalAddr",
+        _ => "Other",
+    };
+    log::info!("[RV_DEBUG] handle_rendezvous_message: type={}", msg_type);
     match rm.union {
         Some(rendezvous_message::Union::PunchHole(ph)) => {
             log::info!("收到 PunchHole（直连请求），处理传入连接...");
@@ -225,7 +251,7 @@ async fn handle_rendezvous_message(
             });
         }
         _ => {
-            log::debug!("收到未处理的消息类型");
+            log::info!("收到未处理的消息类型");
         }
     }
     Ok(())
@@ -265,6 +291,7 @@ async fn send_local_addr_fla(
     config: SosConfig,
     password_refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> ResultType<()> {
+    log::info!("[CONN_DEBUG] >>> send_local_addr_fla called: relay_server='{}'", fla.relay_server);
     use hbb_common::socket_client::connect_tcp;
 
     // 连接到信令服务器
@@ -405,6 +432,8 @@ async fn handle_punch_hole(
     config: SosConfig,
     password_refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> ResultType<()> {
+    log::info!("[CONN_DEBUG] >>> handle_punch_hole called: relay_server='{}' socket_addr.len={}",
+        ph.relay_server, ph.socket_addr.len());
     use hbb_common::protobuf::Enum;
     use hbb_common::rendezvous_proto::NatType;
 
@@ -413,6 +442,7 @@ async fn handle_punch_hole(
     let our_nat =
         NatType::from_i32(crate::sos_config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
 
+    log::info!("[CONN_DEBUG] PunchHole NAT check: remote={:?} us={:?}", remote_nat, our_nat);
     if remote_nat == NatType::SYMMETRIC || our_nat == NatType::SYMMETRIC {
         log::info!(
             "NAT 类型不兼容 (remote={:?}, us={:?})，直接走中继",
@@ -446,9 +476,10 @@ async fn handle_punch_hole(
         .await;
     }
 
-    log::info!("尝试直连对端: {}", peer_addr);
+    log::info!("[CONN_DEBUG] 尝试直连对端: {}", peer_addr);
     // 先尝试 IPv4
     let result = connect_tcp(peer_addr, crate::sos_constants::CONNECT_TIMEOUT).await;
+    log::info!("[CONN_DEBUG] IPv4 direct connect result: {:?}", result.as_ref().map(|_| "OK").unwrap_or("FAIL"));
     match result {
         Ok(stream) => {
             log::info!("IPv4 直连成功，启动连接处理...");
@@ -505,6 +536,8 @@ async fn handle_request_relay(
     config: SosConfig,
     password_refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> ResultType<()> {
+    log::info!("[CONN_DEBUG] >>> handle_request_relay called: relay='{}' uuid.len={} id='{}'",
+        rr.relay_server, rr.uuid.len(), rr.id);
     let relay_host = &rr.relay_server;
     if relay_host.is_empty() {
         return Err(anyhow::anyhow!("Relay server address is empty"));
@@ -550,15 +583,15 @@ async fn handle_relay_fallback(
     uuid: Option<String>,
     peer_id: &str,
 ) -> ResultType<()> {
+    log::info!("[CONN_DEBUG] >>> handle_relay_fallback: relay='{}' uuid={:?} peer_id='{}'", relay_host, uuid, peer_id);
     // 1. 向信令服务器发送 RelayResponse
     let rendezvous_host = check_port(
         &config.rendezvous_server,
         crate::sos_constants::RENDEZVOUS_PORT,
     );
     log::info!(
-        "连接信令服务器请求中继: {} -> relay={}",
-        rendezvous_host,
-        relay_host
+        "[CONN_DEBUG] Step1: connecting to rendezvous server for RelayResponse: {}",
+        rendezvous_host
     );
 
     // uuid：优先使用客户端提供的（RequestRelay 场景），否则随机生成（PunchHole 回退场景）
@@ -588,7 +621,7 @@ async fn handle_relay_fallback(
         let bytes = msg.write_to_bytes()?;
         stream.send_raw(bytes).await?;
         log::info!(
-            "RelayResponse sent to rendezvous server (uuid={})",
+            "[CONN_DEBUG] RelayResponse sent to rendezvous server (uuid={})",
             uuid_str
         );
     } // 信令服务器关闭连接，stream 自动断开
@@ -596,10 +629,11 @@ async fn handle_relay_fallback(
     // 2. 连接中继服务器，发送 RequestRelay（与 RustDesk create_relay_connection 一致）
     let relay_host_port =
         hbb_common::socket_client::check_port(relay_host, hbb_common::config::RELAY_PORT);
-    log::info!("连接中继服务器: {}", relay_host_port);
+    log::info!("[CONN_DEBUG] Step2: connecting to relay server: {}", relay_host_port);
 
     let mut relay_stream =
         connect_tcp(relay_host_port, crate::sos_constants::CONNECT_TIMEOUT).await?;
+    log::info!("[CONN_DEBUG] Relay TCP connection established");
 
     // 构造 RequestRelay 消息（与上游 create_relay_connection_ 和 client::create_relay 对齐）
     // licence_key：优先使用配置中的 server_pub_key，空则回退 RS_PUB_KEY
@@ -619,16 +653,19 @@ async fn handle_relay_fallback(
     let bytes = msg.write_to_bytes()?;
     relay_stream.send_raw(bytes).await?;
     log::info!(
-        "RequestRelay sent to relay server (uuid={}, peer_id={}), waiting for bridge...",
+        "[CONN_DEBUG] RequestRelay sent to relay server (uuid={}, peer_id={}), waiting for bridge...",
         uuid_str,
         peer_id
     );
 
-    crate::sos_connection::handle(
+    log::info!("[CONN_DEBUG] Step3: calling sos_connection::handle() via relay stream");
+    let ret = crate::sos_connection::handle(
         relay_stream,
         "0.0.0.0:0".parse().unwrap(),
         config.clone(),
         Some(&password_refresh_tx),
     )
-    .await
+    .await;
+    log::info!("[CONN_DEBUG] sos_connection::handle() returned: {:?}", ret.as_ref().map(|_| "OK").unwrap_or("ERR"));
+    ret
 }

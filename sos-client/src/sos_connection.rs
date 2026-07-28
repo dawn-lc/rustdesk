@@ -16,114 +16,148 @@ pub async fn handle(
 ) -> ResultType<()> {
     let addr_str = peer_addr.ip().to_string();
     log::info!(
-        "New connection from {}, performing key exchange...",
-        addr_str
+        "[PWD_DEBUG] >>> handle() called: addr={} config.id={} config.password.len={}",
+        addr_str, config.id, config.password.len()
     );
 
     // 检查登录频率限制
     let wait = check_login_rate_limit(&addr_str);
     if wait > 0 {
-        log::warn!("Rate limit for {}, wait {}s", addr_str, wait);
+        log::warn!("[PWD_DEBUG] Rate limit for {}, wait {}s", addr_str, wait);
         return Ok(());
     }
 
     // Phase 1: 密钥交换 + 加密层
+    log::info!("[PWD_DEBUG] Starting key exchange...");
     let mut stream = match setup_encrypted_stream(stream, &config.id).await {
-        Ok(s) => s,
+        Ok(s) => {
+            log::info!("[PWD_DEBUG] Key exchange succeeded");
+            s
+        }
         Err(e) => {
-            log::warn!("Key exchange failed: {}", e);
+            log::warn!("[PWD_DEBUG] Key exchange failed: {}", e);
             return Ok(());
         }
     };
 
     // Phase 2: 登录验证循环
-    // 与 RustDesk 一致：先发送 Hash(salt+challenge)，然后循环等待 LoginRequest
-    // 验证失败时不重新发送 Hash，仅发送错误让客户端重试（使用同一组 salt/challenge）
-    log::info!("Waiting for login request...");
+    log::info!("[PWD_DEBUG] Key exchange done, entering login verification...");
 
-    // 生成 salt 和 challenge（salt 使用持久化值，确保 token 复用跨连接有效）
-    // 注意：与上游一致，salt 是持久化的，challenge 每次连接随机
+    // 生成 salt 和 challenge
     use hbb_common::rand::Rng;
     use hbb_common::sha2::{Digest, Sha256};
     let salt = crate::sos_config::RegistryConfig::get_password_salt();
+    log::info!("[PWD_DEBUG] salt from registry: len={} value='{}'", salt.len(), salt);
     let challenge: String = (0..6)
         .map(|_| {
             hbb_common::rand::thread_rng().sample(hbb_common::rand::distributions::Alphanumeric)
                 as char
         })
         .collect();
+    log::info!("[PWD_DEBUG] generated challenge: len={} value='{}'", challenge.len(), challenge);
 
     // 发送 Hash 给客户端（仅一次）
     {
+        log::info!(
+            "[PWD_DEBUG] Sending Hash message to client: salt='{}' challenge='{}'",
+            salt, challenge
+        );
         let mut hash_msg = Hash::new();
         hash_msg.salt = salt.clone();
         hash_msg.challenge = challenge.clone();
         let mut msg = Message::new();
         msg.set_hash(hash_msg);
         stream.send(&msg).await?;
+        log::info!("[PWD_DEBUG] Hash message sent successfully");
     }
 
     let mut login_attempts = 0;
     const MAX_LOGIN_ATTEMPTS: u32 = 5;
     loop {
-        // 等待 LoginRequest（不重新发送 Hash）
+        log::info!("[PWD_DEBUG] Waiting for LoginRequest (attempt {})...", login_attempts + 1);
         let login_data = match stream.next_timeout(60_000).await {
-            Some(Ok(d)) => d,
+            Some(Ok(d)) => {
+                log::info!("[PWD_DEBUG] Received data from client: {} bytes", d.len());
+                d
+            }
             Some(Err(e)) => {
-                log::info!("Stream error while waiting for login: {}", e);
+                log::info!("[PWD_DEBUG] Stream error while waiting for login: {}", e);
                 return Ok(());
             }
             None => {
-                log::info!("Timeout waiting for login request");
+                log::info!("[PWD_DEBUG] Timeout waiting for login request (60s)");
                 return Ok(());
             }
         };
 
         let login_msg = match Message::parse_from_bytes(&login_data) {
-            Ok(m) => m,
-            Err(_) => continue,
+            Ok(m) => {
+                log::info!("[PWD_DEBUG] Parsed protobuf message successfully");
+                m
+            }
+            Err(e) => {
+                log::warn!("[PWD_DEBUG] Failed to parse protobuf: {}, skipping", e);
+                continue;
+            }
         };
         if !login_msg.has_login_request() {
+            log::warn!("[PWD_DEBUG] Message is not a LoginRequest, skipping");
             continue;
         }
 
         let login_req = login_msg.login_request();
         let received_h2 = &login_req.password;
+        log::info!("[PWD_DEBUG] Got LoginRequest: received_h2.len={}", received_h2.len());
+        log::info!("[PWD_DEBUG] received_h2 hex={}", hex::encode(received_h2));
 
         // 确定用于验证的密码
         let password_to_check = if !config.password.is_empty() {
+            log::info!("[PWD_DEBUG] Using config.password (CLI arg) for verification");
             config.password.clone()
         } else {
+            log::info!("[PWD_DEBUG] config.password is empty, trying get_current_password()");
             let current = crate::sos_config::get_current_password();
+            log::info!("[PWD_DEBUG] get_current_password() returned len={}", current.len());
             if !current.is_empty() {
                 current
             } else {
+                log::warn!("[PWD_DEBUG] Both config.password and get_current_password() are empty!");
                 String::new()
             }
         };
+        log::info!("[PWD_DEBUG] password_to_check='{}' (len={})", password_to_check, password_to_check.len());
 
         let authorized = if !password_to_check.is_empty() {
-            // 与 RustDesk 客户端一致：salt/challenge 是字符串，直接拼接到哈希
-            // h1 = SHA256(password || salt)
-            // h2 = SHA256(h1 || challenge)
+            log::info!("[PWD_DEBUG] Computing h1 = SHA256(password || salt)");
+            log::info!("[PWD_DEBUG]   password bytes={:?}", password_to_check.as_bytes());
+            log::info!("[PWD_DEBUG]   salt bytes={:?}", salt.as_bytes());
             let mut hasher = Sha256::new();
             hasher.update(password_to_check.as_bytes());
             hasher.update(salt.as_bytes());
             let h1 = hasher.finalize();
+            log::info!("[PWD_DEBUG] h1={}", hex::encode(h1));
 
+            log::info!("[PWD_DEBUG] Computing h2 = SHA256(h1 || challenge)");
+            log::info!("[PWD_DEBUG]   challenge bytes={:?}", challenge.as_bytes());
             let mut hasher2 = Sha256::new();
             hasher2.update(h1);
             hasher2.update(challenge.as_bytes());
             let expected_h2 = hasher2.finalize();
+            log::info!("[PWD_DEBUG] expected_h2={}", hex::encode(expected_h2.as_slice()));
+            log::info!("[PWD_DEBUG] received_h2={}", hex::encode(received_h2));
+            log::info!("[PWD_DEBUG] expected_h2.len={} received_h2.len={}", expected_h2.len(), received_h2.len());
 
             let match_ = received_h2 == expected_h2.as_slice();
+            log::info!("[PWD_DEBUG] match={}", match_);
+
             match_
         } else {
+            log::warn!("[PWD_DEBUG] password_to_check is empty, denying access");
             false
         };
 
         if authorized {
-            log::info!("Client authorized, starting services...");
+            log::info!("[PWD_DEBUG] >>> AUTHORIZED <<<");
             clear_login_failures(&addr_str);
             let is_file_transfer = login_msg.login_request().has_file_transfer();
             send_login_response(&mut stream).await?;

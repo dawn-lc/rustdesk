@@ -6922,7 +6922,6 @@ dependencies = [
  "scrap",
  "serde 1.0.228",
  "serde_json 1.0.150",
- "shared_memory",
  "tokio",
  "winapi",
  "windows 0.61.3",

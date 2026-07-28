@@ -1,8 +1,17 @@
 //! SOS 共享内存模块
 //!
 //! SHMEM 创建/打开、布局常量、SosShmemCapturer 读帧、自定义捕获器工厂注入。
+//!
+//! 使用 Windows 原生 `CreateFileMappingW(INVALID_HANDLE_VALUE)` +
+//! `MapViewOfFile`，以系统分页文件为后端，零磁盘写入。
 
-use shared_memory::{Shmem, ShmemConf};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
+    MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, FILE_MAP_ALL_ACCESS,
+    PAGE_READWRITE, VirtualQuery,
+};
 
 // ── SHMEM 帧数据区布局常量（写端 run_capture_shmem 与 读端 SosShmemCapturer 共享） ──
 
@@ -14,63 +23,141 @@ pub const SHMEM_ADDR_CAPTURE_FRAME: usize = 192;
 
 // ── SOS 自有共享内存封装 ──
 
-/// SOS 自有的命名共享内存封装，直接使用 `shared_memory` crate。
+/// SOS 自有的命名共享内存封装。
+///
+/// 使用 Windows `CreateFileMappingW(INVALID_HANDLE_VALUE)` + `MapViewOfFile`
+/// 创建分页文件后端的命名共享内存，**不留任何磁盘文件痕迹**。
+/// Drop 时自动 `UnmapViewOfFile` + `CloseHandle` 清理。
 pub struct SosShmem {
-    inner: Shmem,
+    mapping: HANDLE,
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
 }
 
 unsafe impl Send for SosShmem {}
 unsafe impl Sync for SosShmem {}
 
+impl Drop for SosShmem {
+    fn drop(&mut self) {
+        unsafe {
+            UnmapViewOfFile(self.view);
+            let _ = CloseHandle(self.mapping);
+        }
+    }
+}
+
 impl SosShmem {
-    const SHMEM_DIR: &'static str = "sos_shmem";
+    /// Windows 内核对象名（`CreateFileMappingW` 的命名空间）
+    fn os_id(name: &str) -> Vec<u16> {
+        let wide: Vec<u16> = format!("RustDeskSOS_{}\0", name)
+            .encode_utf16()
+            .collect();
+        wide
+    }
 
     pub fn create(name: &str, size: usize) -> hbb_common::ResultType<Self> {
-        let flink = Self::flink(name);
-        if let Some(parent) = std::path::Path::new(&flink).parent() {
-            std::fs::create_dir_all(parent).ok();
+        let wname = Self::os_id(name);
+        let high = ((size as u64 >> 32) & 0xFFFF_FFFF) as u32;
+        let low = (size as u64 & 0xFFFF_FFFF) as u32;
+
+        let mapping = unsafe {
+            CreateFileMappingW(
+                HANDLE(-1isize as _), // INVALID_HANDLE_VALUE → 分页文件后端
+                None,
+                PAGE_READWRITE,
+                high,
+                low,
+                PCWSTR(wname.as_ptr()),
+            )
+        }?;
+
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size) };
+
+        if view.Value.is_null() {
+            let err = unsafe { windows::Win32::Foundation::GetLastError() };
+            unsafe { let _ = CloseHandle(mapping); };
+            return Err(anyhow::anyhow!(
+                "SosShmem create '{}' MapViewOfFile failed: win32 error {}",
+                name,
+                err.0
+            ));
         }
-        let shmem = ShmemConf::new()
-            .size(size)
-            .flink(&flink)
-            .force_create_flink()
-            .create()
-            .map_err(|e| anyhow::anyhow!("SosShmem create '{}' failed: {}", flink, e))?;
-        log::info!("SosShmem created: flink={} size={}", flink, size);
-        Ok(SosShmem { inner: shmem })
+
+        log::info!(
+            "SosShmem created: name={} size={} mapping=0x{:x} ptr=0x{:x}",
+            name,
+            size,
+            mapping.0 as usize,
+            view.Value as usize
+        );
+        Ok(SosShmem {
+            mapping,
+            view,
+            len: size,
+        })
     }
 
     pub fn open_existing(name: &str) -> hbb_common::ResultType<Self> {
-        let flink = Self::flink(name);
-        let shmem = ShmemConf::new()
-            .flink(&flink)
-            .allow_raw(true)
-            .open()
-            .map_err(|e| anyhow::anyhow!("SosShmem open '{}' failed: {}", flink, e))?;
-        Ok(SosShmem { inner: shmem })
+        let wname = Self::os_id(name);
+
+        let mapping = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, PCWSTR(wname.as_ptr())) }?;
+
+        // 映射整个文件映射视图（传递 0 表示映射整个文件）
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+
+        if view.Value.is_null() {
+            let err = unsafe { windows::Win32::Foundation::GetLastError() };
+            unsafe { let _ = CloseHandle(mapping); };
+            return Err(anyhow::anyhow!(
+                "SosShmem open '{}' MapViewOfFile failed: win32 error {}",
+                name,
+                err.0
+            ));
+        }
+
+        // 查询映射区域的实际大小
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        let query_size = unsafe {
+            VirtualQuery(
+                Some(view.Value),
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let region_size = if query_size > 0 {
+            info.RegionSize
+        } else {
+            0
+        };
+
+        log::info!(
+            "SosShmem opened: name={} mapping=0x{:x} ptr=0x{:x} len={}",
+            name,
+            mapping.0 as usize,
+            view.Value as usize,
+            region_size
+        );
+        Ok(SosShmem {
+            mapping,
+            view,
+            len: region_size,
+        })
     }
 
     pub fn as_ptr(&self) -> *const u8 {
-        self.inner.as_ptr()
+        self.view.Value as *const u8
     }
 
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.len
     }
 
     pub fn write(&self, addr: usize, data: &[u8]) {
         unsafe {
-            debug_assert!(addr + data.len() <= self.inner.len());
-            let dst = self.inner.as_ptr().add(addr);
+            debug_assert!(addr + data.len() <= self.len);
+            let dst = (self.view.Value as *mut u8).add(addr);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
-    }
-
-    fn flink(name: &str) -> String {
-        let dir = std::path::PathBuf::from("C:\\ProgramData\\RustDesk").join(Self::SHMEM_DIR);
-        dir.join(format!("shmem{}", name))
-            .to_string_lossy()
-            .to_string()
     }
 }
 
