@@ -18,18 +18,9 @@ fn main() {
         res.set_icon("../res/icon.ico");
         res.compile().unwrap();
     }
-    // 编译 protobuf
-    let out_dir = format!("{}/protos", std::env::var("OUT_DIR").unwrap());
-    std::fs::create_dir_all(&out_dir).unwrap();
-
-    protobuf_codegen::Codegen::new()
-        .pure()
-        .out_dir(out_dir)
-        .inputs(["protos/rendezvous.proto", "protos/message.proto"])
-        .include("protos")
-        .customize(protobuf_codegen::Customize::default().tokio_bytes(true))
-        .run()
-        .expect("Protobuf codegen failed.");
+    // 协议类型全部来自 `base` crate（它自己生成 `message.proto`）。
+    // 这里曾经也生成一份**本地副本**到 OUT_DIR，但从未被 `include!` ——
+    // 那是分叉前的遗留，留着一份会随上游漂移的协议副本只会误导人。
 
     // 编译 Windows 平台 C++ 辅助代码
     #[cfg(windows)]

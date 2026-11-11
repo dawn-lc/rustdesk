@@ -1,15 +1,16 @@
 //! SOS 文件传输模块
 //!
 //! 完全遵循上游 `ui_cm_interface::handle_fs` 的逻辑，不做任何额外路径变换。
-//! 读取目录用 `hbb_common::fs::read_dir`，路径为客户端传来的原始路径。
+//! 读取目录用 `base::fs::read_dir`，路径为客户端传来的原始路径。
 //! 空路径用 `Config::get_home()`，与上游 CM 一致。
 
-use hbb_common::fs::{self, DataSource, JobType, TransferJob};
-use hbb_common::message_proto::{
+use base::fs::{self, DataSource, JobType, TransferJob};
+use base::message_proto::{
     file_action, FileAction, FileResponse, FileTransferBlock, FileTransferReceiveRequest,
     FileTransferSendRequest,
 };
-use hbb_common::{message_proto::Message, ResultType};
+use base::message_proto::Message;
+use hbb_common::ResultType;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::mpsc;
@@ -140,7 +141,7 @@ impl FileTransferHandler {
     }
 
     /// 处理客户端发送的文件摘要（用于覆盖检测）
-    pub fn handle_digest(&mut self, _digest: &hbb_common::message_proto::FileTransferDigest) {
+    pub fn handle_digest(&mut self, _digest: &base::message_proto::FileTransferDigest) {
         // To-do: implement digest check for overwrite detection
         log::debug!("[FT] Digest received (not implemented)");
     }
@@ -236,7 +237,7 @@ impl FileTransferHandler {
             Ok(_) => {
                 let mut msg = Message::new();
                 let mut fr = FileResponse::new();
-                let mut d = hbb_common::message_proto::FileDirectory::new();
+                let mut d = base::message_proto::FileDirectory::new();
                 d.path = path.to_owned();
                 fr.set_dir(d);
                 msg.set_file_response(fr);
@@ -253,7 +254,7 @@ impl FileTransferHandler {
             Ok(_) => {
                 let mut msg = Message::new();
                 let mut fr = FileResponse::new();
-                let mut d = hbb_common::message_proto::FileDirectory::new();
+                let mut d = base::message_proto::FileDirectory::new();
                 d.path = path.to_owned();
                 fr.set_dir(d);
                 msg.set_file_response(fr);
@@ -270,7 +271,7 @@ impl FileTransferHandler {
             Ok(_) => {
                 let mut msg = Message::new();
                 let mut fr = FileResponse::new();
-                let mut d = hbb_common::message_proto::FileDirectory::new();
+                let mut d = base::message_proto::FileDirectory::new();
                 d.path = path.to_owned();
                 fr.set_dir(d);
                 msg.set_file_response(fr);
@@ -292,7 +293,7 @@ impl FileTransferHandler {
             Ok(_) => {
                 let mut msg = Message::new();
                 let mut fr = FileResponse::new();
-                let mut d = hbb_common::message_proto::FileDirectory::new();
+                let mut d = base::message_proto::FileDirectory::new();
                 d.path = new.to_string_lossy().to_string();
                 fr.set_dir(d);
                 msg.set_file_response(fr);

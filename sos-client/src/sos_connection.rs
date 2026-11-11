@@ -4,8 +4,9 @@
 //! 密钥交换 → 登录验证 → 视频/输入/剪贴板/文件 7 路并发
 
 use crate::sos_config::SosConfig;
+use base::protos::message::*;
 use hbb_common::protobuf::Message as ProtobufMessage;
-use hbb_common::{protos::message::*, ResultType, Stream};
+use hbb_common::{ResultType, Stream};
 
 /// 连接 ID 分配器。
 ///
@@ -252,7 +253,11 @@ async fn setup_encrypted_stream(mut stream: Stream, device_id: &str) -> ResultTy
     let (na_pk, na_sk) = box_::gen_keypair();
 
     // 构造 IdPk 并序列化
-    let id_pk_bytes = hbb_common::protos::message::IdPk {
+    //
+    // `IdPk` 定义在 `hbb_common` 的 rendezvous 协议里（与信令服务器共用），
+    // 不在客户端的 message 协议中。上游新增的 `dtls_fingerprint` / `kx_version`
+    // 与本端无关（非 WebRTC、原始密钥交换），用 `..Default::default()` 留空。
+    let id_pk_bytes = hbb_common::rendezvous_proto::IdPk {
         id: device_id.to_string(),
         pk: hbb_common::bytes::Bytes::from(na_pk.0.to_vec()),
         ..Default::default()
@@ -263,8 +268,8 @@ async fn setup_encrypted_stream(mut stream: Stream, device_id: &str) -> ResultTy
     let signed_id = sign::sign(&id_pk_bytes, &ed_sk);
 
     // 发送 SignedId 消息
-    let mut msg_out = hbb_common::protos::message::Message::new();
-    msg_out.set_signed_id(hbb_common::protos::message::SignedId {
+    let mut msg_out = base::protos::message::Message::new();
+    msg_out.set_signed_id(base::protos::message::SignedId {
         id: signed_id.into(),
         ..Default::default()
     });
@@ -275,7 +280,7 @@ async fn setup_encrypted_stream(mut stream: Stream, device_id: &str) -> ResultTy
         .next_timeout(10_000)
         .await
         .ok_or_else(|| anyhow::anyhow!("Timeout waiting for PublicKey"))??;
-    let pk_msg = hbb_common::protos::message::Message::parse_from_bytes(&pk_data)?;
+    let pk_msg = base::protos::message::Message::parse_from_bytes(&pk_data)?;
     let public_key = pk_msg.public_key();
 
     // 如果 asymmetric_value 为空，表示对端不认识本端公钥
@@ -363,7 +368,7 @@ fn clear_login_failures(peer_addr: &str) {
 /// 发送登录错误（不关闭连接，让客户端重试）
 async fn send_login_error(stream: &mut Stream, err: &str) {
     let mut msg = Message::new();
-    let mut res = hbb_common::protos::message::LoginResponse::new();
+    let mut res = base::protos::message::LoginResponse::new();
     res.set_error(err.to_string());
     msg.set_login_response(res);
     let _ = stream.send(&msg).await;
@@ -448,7 +453,7 @@ async fn send_login_response(
             }
             // 填充支持的分辨率列表（控制端据此显示"更改分辨率"菜单）
             if let Some(d) = displays.first() {
-                use hbb_common::message_proto::SupportedResolutions;
+                use base::message_proto::SupportedResolutions;
                 peer_info.resolutions = Some(SupportedResolutions {
                     resolutions: librustdesk::platform::resolutions(&d.name()),
                     ..Default::default()
@@ -471,7 +476,7 @@ async fn send_login_response(
     }
 
     // 上报功能支持（客户端据此决定输入模式等行为）
-    use hbb_common::message_proto::Features;
+    use base::message_proto::Features;
     peer_info.features = hbb_common::protobuf::MessageField::some(Features {
         privacy_mode: false,
         terminal: false,
@@ -617,45 +622,67 @@ enum Conn {
 
 impl Conn {
     /// 尝试把 TCP 流拆成独立的读/写通道；其他传输方式原样返回。
+    ///
+    /// # 为什么这里有一段 `unsafe`
+    ///
+    /// 上游给 `Stream` 加了 `Drop`（用来关闭 WebRTC 的对等连接），于是不能再
+    /// 按值解构它 —— 即使只想取 `Tcp` 变体也会报 `E0509: cannot move out of
+    /// type which implements the Drop trait`。
+    ///
+    /// 这里把整个值放进 `ManuallyDrop`（阻止它被 drop），再从 `&mut` 上把
+    /// `Tcp` 变体里的 `FramedStream` 按位读出来：
+    ///
+    /// - `FramedStream` 自身没有 `Drop`、四个字段全是 `pub`，按位取出后由我们
+    ///   负责持有并释放，不会泄漏;
+    /// - `Stream::drop` 的全部作用就是 `close_webrtc()`，对非 WebRTC 变体是
+    ///   空操作 —— 所以跳过这次 drop 不改变任何资源释放路径;
+    /// - 取出后立即 `return`，`slot` 之后再也不会被访问。
+    ///
+    /// 非 TCP 变体走 `ManuallyDrop::into_inner` 交回所有权，后续正常 drop，
+    /// WebRTC 的清理不受影响。
     fn split(stream: Stream) -> Self {
-        match stream {
-            Stream::Tcp(hbb_common::tcp::FramedStream(framed, _addr, encrypt, send_timeout)) => {
-                let parts = framed.into_parts();
-                let (read_io, write_io) = hbb_common::tokio::io::split(parts.io);
-                // 读半区必须保留已解码缓冲：登录应答之后对端可能已经在同一
-                // TCP 段里发来了后续消息，丢弃会导致输入事件丢失、流错位。
-                let mut read_parts = FramedParts::new::<Bytes>(read_io, parts.codec);
-                read_parts.read_buf = parts.read_buf;
-                let reader = Framed::from_parts(read_parts);
-                let writer = Framed::new(write_io, BytesCodec::new());
+        let mut slot = std::mem::ManuallyDrop::new(stream);
+        if let Stream::Tcp(framed_stream) = &mut *slot {
+            // SAFETY: 见上方文档 —— 目标是 `Tcp` 变体时才会执行到这里，
+            // 且取出后 `slot` 不再被使用也不会被 drop。
+            let hbb_common::tcp::FramedStream(framed, _addr, encrypt, send_timeout) =
+                unsafe { std::ptr::read(framed_stream) };
 
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let video_bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                // Encrypt 的发送序号(.1)与接收序号(.2)互不相干，各复制一份即可
-                // 让两个方向独立递增，不破坏加密协议。
-                let writer_task = tokio::spawn(write_loop(
-                    writer,
-                    encrypt.clone(),
-                    send_timeout,
-                    rx,
-                    pending.clone(),
-                    bytes_sent.clone(),
-                    video_bytes_sent.clone(),
-                ));
-                Conn::Split {
-                    reader,
-                    decrypt: encrypt,
-                    tx,
-                    pending,
-                    bytes_sent,
-                    video_bytes_sent,
-                    writer_task,
-                }
-            }
-            other => Conn::Whole(other),
+            let parts = framed.into_parts();
+            let (read_io, write_io) = hbb_common::tokio::io::split(parts.io);
+            // 读半区必须保留已解码缓冲：登录应答之后对端可能已经在同一
+            // TCP 段里发来了后续消息，丢弃会导致输入事件丢失、流错位。
+            let mut read_parts = FramedParts::new::<Bytes>(read_io, parts.codec);
+            read_parts.read_buf = parts.read_buf;
+            let reader = Framed::from_parts(read_parts);
+            let writer = Framed::new(write_io, BytesCodec::new());
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let video_bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // Encrypt 的发送序号(.1)与接收序号(.2)互不相干，各复制一份即可
+            // 让两个方向独立递增，不破坏加密协议。
+            let writer_task = tokio::spawn(write_loop(
+                writer,
+                encrypt.clone(),
+                send_timeout,
+                rx,
+                pending.clone(),
+                bytes_sent.clone(),
+                video_bytes_sent.clone(),
+            ));
+            return Conn::Split {
+                reader,
+                decrypt: encrypt,
+                tx,
+                pending,
+                bytes_sent,
+                video_bytes_sent,
+                writer_task,
+            };
         }
+        Conn::Whole(std::mem::ManuallyDrop::into_inner(slot))
     }
 
     /// 投递一条出站消息（拆分后仅入队，不阻塞）
@@ -673,7 +700,7 @@ impl Conn {
                 if backlog > MAX_VIDEO_BACKLOG
                     && matches!(
                         msg.union,
-                        Some(hbb_common::message_proto::message::Union::VideoFrame(_))
+                        Some(base::message_proto::message::Union::VideoFrame(_))
                     )
                 {
                     DROPPED_VIDEO_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -777,7 +804,7 @@ async fn write_loop(
         // 序列化前先判断类型，便于把视频与控制流量分开计量
         let is_video = matches!(
             msg.union,
-            Some(hbb_common::message_proto::message::Union::VideoFrame(_))
+            Some(base::message_proto::message::Union::VideoFrame(_))
         );
         let mut data = match msg.write_to_bytes() {
             Ok(d) => d,
@@ -896,7 +923,7 @@ fn sync_cursor_services(
     conn_id: i32,
     tx: &tokio::sync::mpsc::UnboundedSender<(
         hbb_common::tokio::time::Instant,
-        std::sync::Arc<hbb_common::protos::message::Message>,
+        std::sync::Arc<base::protos::message::Message>,
     )>,
     subscribed: &mut bool,
 ) {
@@ -1207,9 +1234,9 @@ async fn pump_recv(
 
 /// 从原始消息里取出 `TestDelay`（不是该类型则返回 `None`）
 fn parse_test_delay(data: &hbb_common::bytes::BytesMut) -> Option<TestDelay> {
-    let msg = hbb_common::message_proto::Message::parse_from_bytes(data).ok()?;
+    let msg = base::message_proto::Message::parse_from_bytes(data).ok()?;
     match msg.union {
-        Some(hbb_common::message_proto::message::Union::TestDelay(td)) => Some(td),
+        Some(base::message_proto::message::Union::TestDelay(td)) => Some(td),
         _ => None,
     }
 }
@@ -1257,7 +1284,7 @@ async fn run_service_loop(
 
     // 文件传输
     let (ft_tx, mut ft_rx) =
-        tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
+        tokio::sync::mpsc::unbounded_channel::<base::message_proto::Message>();
     let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new(ft_tx);
 
     // 拆分收发：写半区交由独立 task，主循环不会再被 send() 卡住
@@ -1267,12 +1294,12 @@ async fn run_service_loop(
     use hbb_common::tokio::time::Instant as TokioInstant;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
         TokioInstant,
-        std::sync::Arc<hbb_common::protos::message::Message>,
+        std::sync::Arc<base::protos::message::Message>,
     )>();
     // 视频通道用有界 channel 做背压：网络写不动时捕获线程会阻塞，自动降帧
     let (tx_video, mut rx_video) = tokio::sync::mpsc::channel::<(
         tokio::time::Instant,
-        std::sync::Arc<hbb_common::protos::message::Message>,
+        std::sync::Arc<base::protos::message::Message>,
     )>(crate::sos_video::VIDEO_CHANNEL_CAPACITY);
     // 订阅 SOS 自建视频链路（采集→I420→libvpx→发送）。
     // 替代上游 video_service：绕开 codec_thread_num 的线程钳制与每帧 flush。
@@ -1495,7 +1522,7 @@ async fn run_file_transfer_loop(stream: Stream) -> ResultType<()> {
     use tokio::time::{sleep, Duration};
 
     let (ft_tx, mut ft_rx) =
-        tokio::sync::mpsc::unbounded_channel::<hbb_common::message_proto::Message>();
+        tokio::sync::mpsc::unbounded_channel::<base::message_proto::Message>();
     let mut file_transfer = crate::sos_file_transfer::FileTransferHandler::new(ft_tx);
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(10));
 
@@ -1621,10 +1648,10 @@ fn lock_workstation() {
 /// 本端只有 VP8/VP9 软件编码器，H264/H265/AV1 一律降级为 `Auto`，
 /// 由 [`crate::sos_vpx::choose_codec`] 的后备启发式决定。
 fn codec_prefer_of(
-    sd: &hbb_common::message_proto::SupportedDecoding,
+    sd: &base::message_proto::SupportedDecoding,
 ) -> crate::sos_vpx::CodecPrefer {
     use crate::sos_vpx::CodecPrefer;
-    use hbb_common::message_proto::supported_decoding::PreferCodec;
+    use base::message_proto::supported_decoding::PreferCodec;
     match sd.prefer.enum_value() {
         Ok(PreferCodec::VP8) => CodecPrefer::Vp8,
         Ok(PreferCodec::VP9) => CodecPrefer::Vp9,
@@ -1643,7 +1670,7 @@ fn codec_prefer_of(
 /// 把控制端声明的解码能力转交给 `sos_video` 用于选择编码格式。
 ///
 /// 自建视频链路不使用 `scrap` 的编码器，因此无需维护其 `PEER_DECODINGS`。
-fn register_peer_decoding(lr: &hbb_common::message_proto::LoginRequest) {
+fn register_peer_decoding(lr: &base::message_proto::LoginRequest) {
     let sd = lr
         .option
         .as_ref()
@@ -1783,7 +1810,7 @@ async fn handle_incoming_message(
             // 因为客户端每次下发 `OptionMessage` 都会带上这个字段
             // （`src/client.rs::update_options`），只读模式下主动填 No。
             if let Ok(q) = opt.lock_after_session_end.enum_value() {
-                use hbb_common::message_proto::option_message::BoolOption;
+                use base::message_proto::option_message::BoolOption;
                 let want = q == BoolOption::Yes;
                 if want != session.lock_after_session_end {
                     session.lock_after_session_end = want;
@@ -1795,7 +1822,7 @@ async fn handle_incoming_message(
                 }
             }
             if let Ok(q) = opt.image_quality.enum_value() {
-                use hbb_common::message_proto::ImageQuality;
+                use base::message_proto::ImageQuality;
                 // 控制端的画质选择**原样采纳**，与上游
                 // `server::connection::update_options` 的语义一致：
                 // 枚举为 `NotSet` 时才看自定义值，其余情况用枚举值。
@@ -1860,7 +1887,7 @@ async fn handle_incoming_message(
         file_transfer.handle_action(msg.file_action());
         // 响应由 tokio mpsc channel 经 select! 中 ft_rx.recv() 异步发送
     } else if msg.has_file_response() {
-        use hbb_common::message_proto::file_response;
+        use base::message_proto::file_response;
         let resp = msg.file_response();
         match resp.union {
             Some(file_response::Union::Block(ref block)) => {
@@ -1970,7 +1997,7 @@ fn handle_change_resolution(display_idx: Option<usize>, width: usize, height: us
 
 /// 打印消息的所有 union 类型（用于调试客户端发送了什么）
 fn log_msg_types(msg: &Message) {
-    use hbb_common::message_proto::message::Union;
+    use base::message_proto::message::Union;
     if let Some(ref u) = msg.union {
         let name = match u {
             Union::LoginRequest(_) => "LoginRequest",

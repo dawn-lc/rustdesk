@@ -41,6 +41,11 @@ LegalCopyright = "Copyright (C) RustDesk SOS maintainers. Licensed under AGPL-3.
 # 核心公共库
 hbb_common = { path = "../libs/hbb_common" }
 
+# 客户端专用库。上游已把 `message_proto` / `fs` / `protos` 等仅客户端使用的
+# 部分从 `hbb_common` 拆到这里（`hbb_common` 现在只留服务端共用的信令协议、
+# socket 与 Config 核心），所以 sos 的协议类型与文件传输都从 `base` 取。
+base = { path = "../libs/base" }
+
 # 屏幕捕获（仅 Windows DXGI + GDI）
 scrap = { path = "../libs/scrap", default-features = false }
 
@@ -101,10 +106,33 @@ hex = "0.4"
 home = "=0.5.9"
 
 [build-dependencies]
-protobuf-codegen = "3.7"
 cc = "1.0"
 winres = "0.1"
 bindgen = "0.72.1"
+
+# ── 与上游根项目保持一致的依赖补丁 ──
+#
+# `hbb_common` 的 `webrtc` feature 由上游根 `Cargo.toml` 打开，而它依赖的三个
+# crate 必须指向 rustdesk-org 的 fork（上游修了 Windows IPv6 候选地址、
+# SettingEngine 的 max_binding_requests 等 bug）。
+#
+# `[patch]` **只对解析它的那个 workspace 根生效**。sos-client 被根项目
+# `exclude`，是独立 workspace 根、有自己的 Cargo.lock，所以必须在这里重复声明
+# 同一组补丁，否则会解析成 crates.io 上的原版 —— 表现为 hbb_common 编译失败：
+#
+#   no method named `set_ice_max_binding_requests` found for `SettingEngine`
+#   cannot find function `set_no_congestion_control` in `webrtc::sctp::association`
+#
+# 上游调整这些 rev 时，跟着根 `Cargo.toml` 的 `[patch.crates-io]` 一起更新。
+[patch.crates-io]
+libxdo-sys = { path = "../libs/libxdo-sys-stub" }
+# 逐块扩展读缓冲，而不是一来表头就按它声明的长度预留整帧。
+tungstenite = { git = "https://github.com/rustdesk-org/tungstenite-rs", rev = "efce47e5364f00a63302cf07ab1fb13ded478914" }
+# webrtc-util：Windows IPv6 地址字节序、适配器命名与结构体布局修正。
+# webrtc-sctp：RTO 下限、MTU、拥塞控制与重排序窗口的修正（与 KCP 行为对齐）。
+webrtc = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+webrtc-util = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+webrtc-sctp = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
 
 [profile.release]
 opt-level = "s"

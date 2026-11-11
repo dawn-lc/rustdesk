@@ -19,7 +19,7 @@
 #![cfg(all(windows, sos_vpx))]
 
 use crate::sos_vpx::{CodecPrefer, SosCodec, SosVpxConfig, SosVpxEncoder};
-use hbb_common::message_proto::{
+use base::message_proto::{
     message, DisplayInfo, EncodedVideoFrame, EncodedVideoFrames, Message, VideoFrame,
 };
 use hbb_common::ResultType;
@@ -1680,8 +1680,7 @@ fn make_switch_display_msg(
     )?;
     // make_display_changed_msg 可能附带 SwitchDisplay，这里补上光标标志
     if let Some(message::Union::Misc(ref mut misc)) = msg.union {
-        if let Some(hbb_common::message_proto::misc::Union::SwitchDisplay(ref mut sd)) = misc.union
-        {
+        if let Some(base::message_proto::misc::Union::SwitchDisplay(ref mut sd)) = misc.union {
             sd.cursor_embedded = false;
         }
     }

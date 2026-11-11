@@ -172,7 +172,13 @@ piet-coregraphics = "0.6"
 foreign-types = "0.3"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
-tray-icon = { git = "https://github.com/tauri-apps/tray-icon", version = "0.21.3" }
+# `rev` 与根 `Cargo.lock` 记录的提交完全一致，属零行为变更的确定性钉版。
+# 上游只写 `version`，具体 rev 仅存在于根锁文件里；而 sos-client 是被
+# `exclude` 的独立项目、有自己的 Cargo.lock，根清单一旦改动就要重新解析这个
+# git 依赖 —— tauri-apps/tray-icon 的默认分支早已越过 0.21.3（现为 0.26.x），
+# `^0.21.3` 无法满足，会直接编译失败。补上 rev 后两份锁文件都能独立解析到
+# 上游验证过的同一个提交。上游升级时跟根 Cargo.lock 一起更新。
+tray-icon = { git = "https://github.com/tauri-apps/tray-icon", version = "0.21.3", rev = "0a5835b0e6828e37a1f781de9c2d671ae7a939e6" }
 tao = { git = "https://github.com/rustdesk-org/tao", branch = "dev" }
 image = "0.24"
 

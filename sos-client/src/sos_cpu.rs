@@ -125,10 +125,10 @@ pub fn start_cpu_monitor() {
                         *slot = Some((avg, Instant::now()));
                     }
                     // 同时写进上游缓存：`scrap::codec::codec_thread_num()` 等
-                    // 上游代码读的是 `hbb_common::platform::windows::cpu_uage_one_minute()`。
+                    // 上游代码读的是 `base::platform::windows::cpu_uage_one_minute()`。
                     // 我们自己不用它（sos_vpx 的线程数由 recommended_threads 决定），
                     // 但库内其它调用点应当看到真实值而不是 None。
-                    hbb_common::platform::windows::sync_cpu_usage(Some(avg));
+                    base::platform::windows::sync_cpu_usage(Some(avg));
                 }
                 prev = cur;
             }

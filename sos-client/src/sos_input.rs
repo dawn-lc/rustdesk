@@ -61,7 +61,7 @@ pub fn dispatch(msg_type: u32, payload: &[u8]) -> bool {
 fn dispatch_mouse(data: &[u8]) {
     use hbb_common::protobuf::Message;
     let t0 = std::time::Instant::now();
-    match hbb_common::message_proto::MouseEvent::parse_from_bytes(data) {
+    match base::message_proto::MouseEvent::parse_from_bytes(data) {
         Ok(me) => {
             let parse_us = t0.elapsed().as_micros();
             // 直接调 **injector** 而不是 `handle_mouse_` wrapper。
@@ -124,7 +124,7 @@ fn dispatch_mouse(data: &[u8]) {
 /// 再落到 `handle_key_`。SYSTEM 子进程本身就是注入器，这层判断没有意义。
 fn dispatch_key(data: &[u8]) {
     use hbb_common::protobuf::Message;
-    let ke = match hbb_common::message_proto::KeyEvent::parse_from_bytes(data) {
+    let ke = match base::message_proto::KeyEvent::parse_from_bytes(data) {
         Ok(k) => k,
         Err(e) => {
             log::error!("[INPUT] Failed to parse KeyEvent: {}", e);
