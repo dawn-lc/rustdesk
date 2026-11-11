@@ -42,7 +42,13 @@ cargo xtask
 | 路径                              | 说明                                                    |
 | --------------------------------- | ------------------------------------------------------- |
 | `target\release\rustdesk-sos.exe` | cargo 原样输出，**不压缩**，供增量编译使用              |
-| `dist\rustdesk-sos.exe`           | 交付物，UPX 压缩后（实测 **8.75 MB → 2.82 MB，32.3%**） |
+| `dist\rustdesk-sos.exe`           | 交付物，UPX 压缩后（实测 **13.57 MB → 3.98 MB，29.4%**） |
+
+体积几乎全部来自上游 `librustdesk`：sos 自己只负责采集/编码/连接，但 `Stream`、
+`input_service`、`clipboard` 等都复用上游实现。2026-11 同步上游 master 后产物
+涨了约 1 MB（压缩前 9.1 → 13.6 MB），原因是上游把 WebRTC 做成了
+`hbb_common::Stream` 的一个变体 —— `Stream::drop` 会分发到 `close_webrtc()`，
+链接器因此无法裁剪整条 WebRTC 栈。sos 自身不走 WebRTC，但这段代码不是死代码。
 
 `build.rs` 用 `bindgen` 生成 libvpx 绑定。视频链路**强依赖**它：没有 libvpx 时
 `build.rs` 不会置 `sos_vpx`，`main.rs` 里对应的 `compile_error!` 会直接说明原因
@@ -71,7 +77,7 @@ cargo xtask
 
 ### 为什么不直接 `cargo build --release`
 
-直接构建也能用，但产物是未压缩的 8.75 MB。`cargo xtask` 额外做三件事：
+直接构建也能用，但产物是未压缩的 13.57 MB。`cargo xtask` 额外做三件事：
 编译 → 复制到 `dist\` → 压缩并校验。
 
 **压缩的是副本，不是 `target\release` 里的原件。** 这一点很关键：cargo 用产物
