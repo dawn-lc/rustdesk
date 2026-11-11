@@ -56,6 +56,9 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
-
-
+# libdrmtap is cloned at build time by build.py (not a submodule)
+/third_party/libdrmtap/
+# Local git worktrees
+.worktrees/
+# sos-client 是独立项目（见 Cargo.toml 的 exclude），有自己的 target/
 /sos-client/target

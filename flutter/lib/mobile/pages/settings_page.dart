@@ -18,8 +18,10 @@ import '../../consts.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../widgets/deploy_dialog.dart';
+import '../../models/shortcut_model.dart';
 import '../widgets/dialog.dart';
 import 'home_page.dart';
+import 'mobile_keyboard_shortcuts_page.dart';
 import 'scan_page.dart';
 
 class SettingsPage extends StatefulWidget implements PageShape {
@@ -97,10 +99,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _hideNetwork = false;
   var _hideWebSocket = false;
   var _enableTrustedDevices = false;
+  var _enableTcpPunch = false;
   var _enableUdpPunch = false;
   var _allowInsecureTlsFallback = false;
   var _disableUdp = false;
   var _enableIpv6Punch = false;
+  var _enableWebrtc = false;
   var _isUsingPublicServer = false;
   var _allowAskForNoteAtEndOfConnection = false;
   var _preventSleepWhileConnected = true;
@@ -141,8 +145,10 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y' ||
             isWeb;
     _enableTrustedDevices = mainGetBoolOptionSync(kOptionEnableTrustedDevices);
+    _enableTcpPunch = mainGetLocalBoolOptionSync(kOptionEnableTcpPunch);
     _enableUdpPunch = mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
     _enableIpv6Punch = mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
+    _enableWebrtc = mainGetLocalBoolOptionSync(kOptionEnableWebrtc);
     _allowAskForNoteAtEndOfConnection =
         mainGetLocalBoolOptionSync(kOptionAllowAskForNoteAtEndOfConnection);
     _preventSleepWhileConnected =
@@ -353,11 +359,27 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           onToggle: isOptionFixed(kOptionEnableTrustedDevices)
               ? null
               : (v) async {
-                  mainSetBoolOption(kOptionEnableTrustedDevices, v);
-                  setState(() {
-                    _enableTrustedDevices = v;
-                  });
+                  try {
+                    await mainSetBoolOption(kOptionEnableTrustedDevices, v);
+                    if (!mounted) return;
+                    setState(() {
+                      _enableTrustedDevices = v;
+                    });
+                  } catch (error) {
+                    showToast(error.toString());
+                  }
                 },
+        ),
+      if (enable2fa && _enableTrustedDevices)
+        SettingsTile(
+          title: Text(translate('Trust duration (days)')),
+          trailing: trustedDeviceExpiration(
+            enabled: true,
+            showLabel: false,
+            onChanged: () {
+              if (mounted) setState(() {});
+            },
+          ),
         ),
       if (enable2fa && _enableTrustedDevices)
         SettingsTile(
@@ -817,29 +839,63 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             ),
           if (!incomingOnly)
             SettingsTile.switchTile(
+              title: Text(translate('Enable TCP hole punching')),
+              initialValue: _enableTcpPunch,
+              onToggle: isOptionFixed(kOptionEnableTcpPunch)
+                  ? null
+                  : (v) async {
+                      await mainSetLocalBoolOption(kOptionEnableTcpPunch, v);
+                      final newValue =
+                          mainGetLocalBoolOptionSync(kOptionEnableTcpPunch);
+                      setState(() {
+                        _enableTcpPunch = newValue;
+                      });
+                    },
+            ),
+          if (!incomingOnly)
+            SettingsTile.switchTile(
               title: Text(translate('Enable UDP hole punching')),
               initialValue: _enableUdpPunch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableUdpPunch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
-                setState(() {
-                  _enableUdpPunch = newValue;
-                });
-              },
+              onToggle: isOptionFixed(kOptionEnableUdpPunch)
+                  ? null
+                  : (v) async {
+                      await mainSetLocalBoolOption(kOptionEnableUdpPunch, v);
+                      final newValue =
+                          mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
+                      setState(() {
+                        _enableUdpPunch = newValue;
+                      });
+                    },
             ),
           if (!incomingOnly)
             SettingsTile.switchTile(
               title: Text(translate('Enable IPv6 P2P connection')),
               initialValue: _enableIpv6Punch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableIpv6Punch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
-                setState(() {
-                  _enableIpv6Punch = newValue;
-                });
-              },
+              onToggle: isOptionFixed(kOptionEnableIpv6Punch)
+                  ? null
+                  : (v) async {
+                      await mainSetLocalBoolOption(kOptionEnableIpv6Punch, v);
+                      final newValue =
+                          mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
+                      setState(() {
+                        _enableIpv6Punch = newValue;
+                      });
+                    },
+            ),
+          if (!incomingOnly)
+            SettingsTile.switchTile(
+              title: Text(translate('Enable WebRTC P2P connection')),
+              initialValue: _enableWebrtc,
+              onToggle: isOptionFixed(kOptionEnableWebrtc)
+                  ? null
+                  : (v) async {
+                      await mainSetLocalBoolOption(kOptionEnableWebrtc, v);
+                      final newValue =
+                          mainGetLocalBoolOptionSync(kOptionEnableWebrtc);
+                      setState(() {
+                        _enableWebrtc = newValue;
+                      });
+                    },
             ),
           SettingsTile(
               title: Text(translate('Language')),
@@ -859,6 +915,24 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               showThemeSettings(gFFI.dialogManager);
             },
           ),
+          if (!disabledSettings)
+            SettingsTile.navigation(
+              leading: Icon(Icons.keyboard_outlined),
+              title: Text(translate('Keyboard shortcuts')),
+              description: Text(ShortcutModel.isEnabled()
+                  ? translate('On')
+                  : translate('Off')),
+              trailing: Icon(Icons.arrow_forward_ios),
+              onPressed: (context) {
+                Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => const MobileKeyboardShortcutsPage(),
+                    )).then((_) {
+                  if (mounted) setState(() {});
+                });
+              },
+            ),
           if (!bind.isDisableAccount())
             SettingsTile.switchTile(
               title: Text(translate('note-at-conn-end-tip')),
@@ -1269,16 +1343,18 @@ class __DisplayPageState extends State<_DisplayPage> {
   }
 
   SettingsTile otherRow(String label, String key) {
-    final value = bind.mainGetUserDefaultOption(key: key) == 'Y';
-    final isOptFixed = isOptionFixed(key);
+    final value = getOtherDefaultSettingOption(key) == 'Y';
+    final isOptFixed = isOtherDefaultSettingReadOnly(key);
     return SettingsTile.switchTile(
       initialValue: value,
       title: Text(translate(label)),
       onToggle: isOptFixed
           ? null
           : (b) async {
-              await bind.mainSetUserDefaultOption(
-                  key: key, value: b ? 'Y' : defaultOptionNo);
+              await setOtherDefaultSettingOption(
+                key,
+                b ? 'Y' : defaultOptionNo,
+              );
               setState(() {});
             },
     );

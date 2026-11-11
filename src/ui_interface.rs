@@ -1,9 +1,10 @@
+use base::config::keys::{self, *};
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use hbb_common::password_security;
 use hbb_common::{
     allow_err,
     bytes::Bytes,
-    config::{self, keys::*, Config, LocalConfig, PeerConfig, CONNECT_TIMEOUT, RENDEZVOUS_PORT},
+    config::{self, Config, LocalConfig, PeerConfig, CONNECT_TIMEOUT, RENDEZVOUS_PORT},
     directories_next,
     futures::future::join_all,
     log,
@@ -106,9 +107,18 @@ pub fn goto_install() {
 pub fn install_me(_options: String, _path: String, _silent: bool, _debug: bool) {
     #[cfg(windows)]
     std::thread::spawn(move || {
-        allow_err!(crate::platform::windows::install_me(
-            &_options, _path, _silent, _debug
-        ));
+        if let Err(err) = crate::platform::windows::install_me(&_options, _path, _silent, _debug) {
+            log::error!("Installation failed: {err:#}");
+            if !_silent
+                && !err
+                    .downcast_ref::<::windows::core::Error>()
+                    .is_some_and(|err| {
+                        err.code() == ::windows::Win32::Foundation::ERROR_CANCELLED.to_hresult()
+                    })
+            {
+                crate::platform::windows::message_box(&format!("Installation failed:\n{err:#}!"));
+            }
+        }
         std::process::exit(0);
     });
 }
@@ -185,11 +195,11 @@ pub fn use_texture_render() -> bool {
 
     #[cfg(target_os = "macos")]
     return cfg!(feature = "flutter")
-        && LocalConfig::get_option(config::keys::OPTION_TEXTURE_RENDER) == "Y";
+        && LocalConfig::get_option(keys::OPTION_TEXTURE_RENDER) == "Y";
 
     #[cfg(target_os = "linux")]
     return cfg!(feature = "flutter")
-        && LocalConfig::get_option(config::keys::OPTION_TEXTURE_RENDER) != "N";
+        && LocalConfig::get_option(keys::OPTION_TEXTURE_RENDER) != "N";
 
     #[cfg(target_os = "windows")]
     {
@@ -202,9 +212,9 @@ pub fn use_texture_render() -> bool {
         #[cfg(not(debug_assertions))]
         let default_texture = crate::platform::is_win_10_or_greater();
         if default_texture {
-            LocalConfig::get_option(config::keys::OPTION_TEXTURE_RENDER) != "N"
+            LocalConfig::get_option(keys::OPTION_TEXTURE_RENDER) != "N"
         } else {
-            return LocalConfig::get_option(config::keys::OPTION_TEXTURE_RENDER) == "Y";
+            return LocalConfig::get_option(keys::OPTION_TEXTURE_RENDER) == "Y";
         }
     }
 }
@@ -409,17 +419,52 @@ pub fn get_sound_inputs() -> Vec<String> {
 
 #[inline]
 pub fn set_options(m: HashMap<String, String>) {
+    hbb_common::allow_err!(try_set_options(m));
+}
+
+pub fn try_set_options(m: HashMap<String, String>) -> hbb_common::ResultType<()> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        *OPTIONS.lock().unwrap() = m.clone();
-        ipc::set_options(m).ok();
+        if !crate::trusted_devices::config::changes_authentication(&m) {
+            *OPTIONS.lock().unwrap() = m.clone();
+            hbb_common::allow_err!(ipc::set_options(m));
+            return Ok(());
+        }
+        ipc::set_options(m.clone())?;
+        *OPTIONS.lock().unwrap() = m;
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    Config::set_options(m);
+    crate::trusted_devices::config::set_options(m)?;
+    Ok(())
+}
+
+pub fn set_auth_option(key: String, value: String) -> hbb_common::ResultType<()> {
+    if key == keys::OPTION_TRUSTED_DEVICE_EXPIRATION
+        && !matches!(value.as_str(), "" | "1" | "7" | "30" | "90" | "0")
+    {
+        hbb_common::bail!("Invalid trusted-device expiration period");
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let mut options = ipc::get_options();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let mut options = Config::get_options();
+    if value.is_empty() {
+        options.remove(&key);
+    } else {
+        options.insert(key, value);
+    }
+    try_set_options(options)
 }
 
 #[inline]
 pub fn set_option(key: String, value: String) {
+    if key == "2fa"
+        || key == keys::OPTION_ENABLE_TRUSTED_DEVICES
+        || key == keys::OPTION_TRUSTED_DEVICE_EXPIRATION
+    {
+        hbb_common::allow_err!(set_auth_option(key, value));
+        return;
+    }
     if &key == "stop-service" {
         #[cfg(target_os = "macos")]
         {
@@ -647,7 +692,13 @@ pub fn set_permanent_password_with_result(password: String) -> bool {
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        return config::Config::set_permanent_password(&password);
+        return match crate::trusted_devices::config::set_password(&password) {
+            Ok(updated) => updated,
+            Err(error) => {
+                log::error!("Password change rejected: {error}");
+                false
+            }
+        };
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -747,13 +798,14 @@ pub fn current_is_wayland() -> bool {
 
 #[inline]
 pub fn get_new_version() -> String {
-    (*SOFTWARE_UPDATE_URL
+    SOFTWARE_UPDATE_URL
         .lock()
         .unwrap()
+        .trim_end_matches('/')
         .rsplit('/')
         .next()
-        .unwrap_or(""))
-    .to_string()
+        .unwrap_or("")
+        .to_owned()
 }
 
 #[inline]
@@ -1703,31 +1755,6 @@ pub fn set_unlock_pin(pin: String) -> String {
 }
 
 #[cfg(feature = "flutter")]
-pub fn get_trusted_devices() -> String {
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    return Config::get_trusted_devices_json();
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    return ipc::get_trusted_devices();
-}
-
-#[cfg(feature = "flutter")]
-pub fn remove_trusted_devices(json: &str) {
-    let hwids = serde_json::from_str::<Vec<Bytes>>(json).unwrap_or_default();
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    Config::remove_trusted_devices(&hwids);
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    ipc::remove_trusted_devices(hwids);
-}
-
-#[cfg(feature = "flutter")]
-pub fn clear_trusted_devices() {
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    Config::clear_trusted_devices();
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    ipc::clear_trusted_devices();
-}
-
-#[cfg(feature = "flutter")]
 pub fn max_encrypt_len() -> usize {
     hbb_common::config::ENCRYPT_MAX_LEN
 }
@@ -1740,16 +1767,7 @@ pub fn is_remote_modify_enabled_by_control_permissions() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{trim_video_save_directory, validate_windows_service_video_save_directory};
-
-    #[test]
-    fn trim_configured_video_save_directory() {
-        assert_eq!(
-            trim_video_save_directory("  relative/recordings  "),
-            Some("relative/recordings")
-        );
-        assert_eq!(trim_video_save_directory("  "), None);
-    }
+    use super::validate_windows_service_video_save_directory;
 
     #[test]
     fn validate_service_video_save_directory() {

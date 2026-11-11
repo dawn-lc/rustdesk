@@ -936,26 +936,21 @@ void enterPasswordDialog(
   );
 }
 
-void enterUserLoginDialog(
-    SessionID sessionId,
-    OverlayDialogManager dialogManager,
-    String osAccountDescTip,
-    bool canRememberAccount) async {
+void enterUserLoginDialog(SessionID sessionId,
+    OverlayDialogManager dialogManager, String osAccountDescTip,
+    {bool waitForAccept = false}) async {
   await _connectDialog(
     sessionId,
     dialogManager,
     osUsernameController: TextEditingController(),
     osPasswordController: TextEditingController(),
     osAccountDescTip: osAccountDescTip,
-    canRememberAccount: canRememberAccount,
+    waitForAccept: waitForAccept,
   );
 }
 
-void enterUserLoginAndPasswordDialog(
-    SessionID sessionId,
-    OverlayDialogManager dialogManager,
-    String osAccountDescTip,
-    bool canRememberAccount) async {
+void enterUserLoginAndPasswordDialog(SessionID sessionId,
+    OverlayDialogManager dialogManager, String osAccountDescTip) async {
   await _connectDialog(
     sessionId,
     dialogManager,
@@ -963,7 +958,6 @@ void enterUserLoginAndPasswordDialog(
     osPasswordController: TextEditingController(),
     passwordController: TextEditingController(),
     osAccountDescTip: osAccountDescTip,
-    canRememberAccount: canRememberAccount,
   );
 }
 
@@ -974,17 +968,12 @@ _connectDialog(
   TextEditingController? osPasswordController,
   TextEditingController? passwordController,
   String? osAccountDescTip,
-  bool canRememberAccount = true,
+  bool waitForAccept = false,
 }) async {
   final errUsername = ''.obs;
   var rememberPassword = false;
   if (passwordController != null) {
     rememberPassword =
-        await bind.sessionGetRemember(sessionId: sessionId) ?? false;
-  }
-  var rememberAccount = false;
-  if (canRememberAccount && osUsernameController != null) {
-    rememberAccount =
         await bind.sessionGetRemember(sessionId: sessionId) ?? false;
   }
   if (osUsernameController != null) {
@@ -1014,12 +1003,6 @@ _connectDialog(
       final osPassword = osPasswordController?.text.trim() ?? '';
       final password = passwordController?.text.trim() ?? '';
       if (passwordController != null && password.isEmpty) return;
-      if (rememberAccount) {
-        bind.sessionPeerOption(
-            sessionId: sessionId, name: 'os-username', value: osUsername);
-        bind.sessionPeerOption(
-            sessionId: sessionId, name: 'os-password', value: osPassword);
-      }
       gFFI.login(
         osUsername,
         osPassword,
@@ -1028,8 +1011,17 @@ _connectDialog(
         rememberPassword,
       );
       close();
-      dialogManager.showLoading(translate('Logging in...'),
-          onCancel: closeConnection);
+      if (waitForAccept) {
+        showWaitAcceptDialog(
+            sessionId,
+            'wait-remote-accept-nook',
+            'Prompt',
+            'Please wait for the remote side to accept your session request...',
+            dialogManager);
+      } else {
+        dialogManager.showLoading(translate('Logging in...'),
+            onCancel: closeConnection);
+      }
     }
 
     descWidget(String text) {
@@ -1096,16 +1088,6 @@ _connectDialog(
             controller: osPasswordController,
             autoFocus: false,
           ),
-          if (canRememberAccount)
-            rememberWidget(
-              translate('remember_account_tip'),
-              rememberAccount,
-              (v) {
-                if (v != null) {
-                  setState(() => rememberAccount = v);
-                }
-              },
-            ),
         ],
       );
     }
@@ -1542,91 +1524,6 @@ showSetOSPassword(
   });
 }
 
-showSetOSAccount(
-  SessionID sessionId,
-  OverlayDialogManager dialogManager,
-) async {
-  final usernameController = TextEditingController();
-  final passwdController = TextEditingController();
-  var username =
-      await bind.sessionGetOption(sessionId: sessionId, arg: 'os-username') ??
-          '';
-  var password =
-      await bind.sessionGetOption(sessionId: sessionId, arg: 'os-password') ??
-          '';
-  usernameController.text = username;
-  passwdController.text = password;
-  dialogManager.show((setState, close, context) {
-    submit() {
-      final username = usernameController.text.trim();
-      final password = usernameController.text.trim();
-      bind.sessionPeerOption(
-          sessionId: sessionId, name: 'os-username', value: username);
-      bind.sessionPeerOption(
-          sessionId: sessionId, name: 'os-password', value: password);
-      close();
-    }
-
-    descWidget(String text) {
-      return Column(
-        children: [
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              text,
-              maxLines: 3,
-              softWrap: true,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 16),
-            ),
-          ),
-          Container(
-            height: 8,
-          ),
-        ],
-      );
-    }
-
-    return CustomAlertDialog(
-      title: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.password_rounded, color: MyTheme.accent),
-          Text(translate('OS Account')).paddingOnly(left: 10),
-        ],
-      ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          descWidget(translate("os_account_desk_tip")),
-          DialogTextField(
-            title: translate(DialogTextField.kUsernameTitle),
-            controller: usernameController,
-            prefixIcon: DialogTextField.kUsernameIcon,
-            errorText: null,
-          ),
-          PasswordWidget(controller: passwdController),
-        ],
-      ),
-      actions: [
-        dialogButton(
-          "Cancel",
-          icon: Icon(Icons.close_rounded),
-          onPressed: close,
-          isOutline: true,
-        ),
-        dialogButton(
-          "OK",
-          icon: Icon(Icons.done_rounded),
-          onPressed: submit,
-        ),
-      ],
-      onSubmit: submit,
-      onCancel: close,
-    );
-  });
-}
-
 Widget buildNoteTextField({
   required TextEditingController controller,
   required VoidCallback onEscape,
@@ -2014,26 +1911,110 @@ customImageQualityDialog(SessionID sessionId, String id, FFI ffi) async {
   msgBoxCommon(ffi.dialogManager, 'Custom Image Quality', content, [btnClose]);
 }
 
-trackpadSpeedDialog(SessionID sessionId, FFI ffi) async {
-  int initSpeed = ffi.inputModel.trackpadSpeed;
+int? _validateTrackpadSpeed(String text) {
+  final speed = int.tryParse(text);
+  if (speed == null || speed < kMinTrackpadSpeed || speed > kMaxTrackpadSpeed) {
+    BotToast.showText(
+      text:
+          '${translate('Invalid format')}: $kMinTrackpadSpeed-$kMaxTrackpadSpeed',
+      contentColor: Colors.red,
+    );
+    return null;
+  }
+  return speed;
+}
+
+Future<void> _saveTrackpadSpeed({
+  required SessionID sessionId,
+  required FFI ffi,
+  required int initSpeed,
+  required int speed,
+}) async {
+  if (speed == initSpeed) {
+    return;
+  }
+  await bind.sessionSetTrackpadSpeed(sessionId: sessionId, value: speed);
+  await ffi.inputModel.updateTrackpadSpeed();
+}
+
+void _showTrackpadSpeedSaveError(Object error, StackTrace stackTrace) {
+  debugPrint('Failed to save trackpad speed: $error');
+  debugPrintStack(stackTrace: stackTrace);
+  BotToast.showText(
+    text: translate('Failed'),
+    contentColor: Colors.red,
+  );
+}
+
+List<Widget> _trackpadSpeedDialogActions({
+  required bool isSubmitting,
+  required VoidCallback close,
+  required VoidCallback submit,
+}) {
+  return [
+    dialogButton(
+      'Cancel',
+      icon: Icon(Icons.close_rounded),
+      onPressed: isSubmitting ? null : close,
+      isOutline: true,
+    ),
+    dialogButton(
+      'OK',
+      icon: Icon(Icons.done_rounded),
+      onPressed: isSubmitting ? null : submit,
+    ),
+  ];
+}
+
+void trackpadSpeedDialog(SessionID sessionId, FFI ffi) {
+  final initSpeed = ffi.inputModel.trackpadSpeed;
   final curSpeed = SimpleWrapper(initSpeed);
-  final btnClose = dialogButton('Close', onPressed: () async {
-    if (curSpeed.value <= kMaxTrackpadSpeed &&
-        curSpeed.value >= kMinTrackpadSpeed &&
-        curSpeed.value != initSpeed) {
-      await bind.sessionSetTrackpadSpeed(
-          sessionId: sessionId, value: curSpeed.value);
-      await ffi.inputModel.updateTrackpadSpeed();
+  var speedText = initSpeed.toString();
+  var isSubmitting = false;
+  ffi.dialogManager.show((setState, close, context) {
+    Future<void> submit([String? submittedText]) async {
+      if (isSubmitting) {
+        return;
+      }
+      speedText = submittedText ?? speedText;
+      final speed = _validateTrackpadSpeed(speedText);
+      if (speed == null) {
+        return;
+      }
+      setState(() => isSubmitting = true);
+      try {
+        await _saveTrackpadSpeed(
+          sessionId: sessionId,
+          ffi: ffi,
+          initSpeed: initSpeed,
+          speed: speed,
+        );
+        close();
+      } catch (error, stackTrace) {
+        _showTrackpadSpeedSaveError(error, stackTrace);
+        setState(() => isSubmitting = false);
+      }
     }
-    ffi.dialogManager.dismissAll();
-  });
-  msgBoxCommon(
-      ffi.dialogManager,
-      'Trackpad speed',
-      TrackpadSpeedWidget(
-        value: curSpeed,
+
+    return CustomAlertDialog(
+      title: Text(
+        translate('Trackpad speed'),
+        style: TextStyle(fontSize: 21),
       ),
-      [btnClose]);
+      content: TrackpadSpeedWidget(
+        value: curSpeed,
+        onTextChanged: (text) => speedText = text,
+        onTextSubmitted: submit,
+      ),
+      actions: _trackpadSpeedDialogActions(
+        isSubmitting: isSubmitting,
+        close: close,
+        submit: submit,
+      ),
+      onSubmit: isSubmitting ? null : submit,
+      onCancel: isSubmitting ? null : close,
+    );
+  });
 }
 
 void deleteConfirmDialog(Function onSubmit, String title) async {
@@ -2309,9 +2290,12 @@ void changeBot({Function()? callback}) async {
 
 void change2fa({Function()? callback}) async {
   if (bind.mainHasValid2FaSync()) {
-    await bind.mainSetOption(key: "2fa", value: "");
-    await bind.mainClearTrustedDevices();
-    callback?.call();
+    try {
+      await bind.mainSetOption(key: "2fa", value: "");
+      callback?.call();
+    } catch (error) {
+      showToast(error.toString());
+    }
     return;
   }
   var new2fa = (await bind.mainGenerate2Fa());
@@ -2826,23 +2810,48 @@ void confrimDeleteTrustedDevicesDialog(
   CommonConfirmDialog(gFFI.dialogManager, '${translate('Confirm Delete')}?',
       () async {
     if (selectedDevices.isEmpty) return;
-    if (selectedDevices.length == trustedDevices.length) {
-      await bind.mainClearTrustedDevices();
-      trustedDevices.clear();
-      selectedDevices.clear();
-    } else {
-      final json = jsonEncode(selectedDevices.map((e) => e.toList()).toList());
-      await bind.mainRemoveTrustedDevices(json: json);
-      trustedDevices.removeWhere((element) {
-        return selectedDevices.contains(element.hwid);
-      });
-      selectedDevices.clear();
+    try {
+      if (selectedDevices.length == trustedDevices.length) {
+        await bind.mainClearTrustedDevices();
+        trustedDevices.clear();
+        selectedDevices.clear();
+      } else {
+        final json = jsonEncode(selectedDevices.map((e) => e.toList()).toList());
+        await bind.mainRemoveTrustedDevices(json: json);
+        trustedDevices.removeWhere((element) {
+          return selectedDevices.contains(element.recordId);
+        });
+        selectedDevices.clear();
+      }
+    } catch (error) {
+      showToast(error.toString());
     }
   });
 }
 
+Future<void> renewTrustedDevice(
+    TrustedDevice device,
+    RxList<TrustedDevice> trustedDevices,
+    RxList<Uint8List> selectedDevices) async {
+  try {
+    final json = jsonEncode([device.recordId.toList()]);
+    await bind.mainRenewTrustedDevices(json: json);
+    final result = await TrustedDevice.get();
+    selectedDevices.clear();
+    trustedDevices.assignAll(result);
+  } catch (error) {
+    showToast(error.toString());
+  }
+}
+
 void manageTrustedDeviceDialog() async {
-  RxList<TrustedDevice> trustedDevices = (await TrustedDevice.get()).obs;
+  late final RxList<TrustedDevice> trustedDevices;
+  try {
+    trustedDevices = (await TrustedDevice.get()).obs;
+  } catch (error) {
+    showToast(error.toString());
+    return;
+  }
   RxList<Uint8List> selectedDevices = RxList.empty();
   gFFI.dialogManager.show((setState, close, context) {
     return CustomAlertDialog(
@@ -2868,25 +2877,67 @@ void manageTrustedDeviceDialog() async {
   });
 }
 
+Widget trustedDeviceExpiration({
+  required bool enabled,
+  required VoidCallback onChanged,
+  bool showLabel = true,
+}) {
+  final period = bind.mainGetOptionSync(key: kOptionTrustedDeviceExpiration);
+  const periods = ['1', '7', '30', '90', '0'];
+  const dropdownHeight = 36.0;
+  return Align(
+    alignment: AlignmentDirectional.centerStart,
+    child: Wrap(
+      spacing: 12,
+      runSpacing: 8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        if (showLabel) Text(translate('Trust duration (days)')),
+        SizedBox(
+          width: isDesktop || isWebDesktop ? 140 : 100,
+          height: dropdownHeight,
+          child: ComboBox(
+            keys: periods,
+            values: ['1', '7', '30', '90', translate('Forever')],
+            initialKey: periods.contains(period) ? period : '90',
+            enabled: enabled && !isOptionFixed(kOptionTrustedDeviceExpiration),
+            onChanged: (value) async {
+              try {
+                await bind.mainSetOption(
+                    key: kOptionTrustedDeviceExpiration, value: value);
+              } catch (error) {
+                showToast(error.toString());
+              }
+              onChanged();
+            },
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
 class TrustedDevice {
-  late final Uint8List hwid;
+  late final Uint8List recordId;
   late final int time;
+  late final int expiresAt;
   late final String id;
   late final String name;
   late final String platform;
 
   TrustedDevice.fromJson(Map<String, dynamic> json) {
-    final hwidList = json['hwid'] as List<dynamic>;
-    hwid = Uint8List.fromList(hwidList.cast<int>());
+    final recordIdList = json['record_id'] as List<dynamic>;
+    recordId = Uint8List.fromList(recordIdList.cast<int>());
     time = json['time'];
+    expiresAt = json['expires_at'];
     id = json['id'];
     name = json['name'];
     platform = json['platform'];
   }
 
   String daysRemaining() {
-    final expiry = time + 90 * 24 * 60 * 60 * 1000;
-    final remaining = expiry - DateTime.now().millisecondsSinceEpoch;
+    if (expiresAt == 0) return translate('Forever');
+    final remaining = expiresAt - DateTime.now().millisecondsSinceEpoch;
     if (remaining < 0) {
       return '0';
     }
@@ -2895,18 +2946,11 @@ class TrustedDevice {
 
   static Future<List<TrustedDevice>> get() async {
     final List<TrustedDevice> devices = List.empty(growable: true);
-    try {
-      final devicesJson = await bind.mainGetTrustedDevices();
-      if (devicesJson.isNotEmpty) {
-        final devicesList = json.decode(devicesJson);
-        if (devicesList is List) {
-          for (var device in devicesList) {
-            devices.add(TrustedDevice.fromJson(device));
-          }
-        }
-      }
-    } catch (e) {
-      print(e.toString());
+    final devicesJson = await bind.mainGetTrustedDevices();
+    final result = json.decode(devicesJson) as Map<String, dynamic>;
+    final devicesList = result['devices'] as List;
+    for (final device in devicesList) {
+      devices.add(TrustedDevice.fromJson(device));
     }
     devices.sort((a, b) => b.time.compareTo(a.time));
     return devices;
@@ -2940,7 +2984,7 @@ Widget trustedDevicesTable(
               onChanged: (value) {
                 if (value == true) {
                   selectedDevices.clear();
-                  selectedDevices.addAll(devices.map((e) => e.hwid));
+                  selectedDevices.addAll(devices.map((e) => e.recordId));
                 } else {
                   selectedDevices.clear();
                 }
@@ -2954,21 +2998,30 @@ Widget trustedDevicesTable(
           rows: devices.map((device) {
             return DataRow(cells: [
               DataCell(Checkbox(
-                value: selectedDevices.contains(device.hwid),
+                value: selectedDevices.contains(device.recordId),
                 onChanged: (value) {
                   if (value == null) return;
                   if (value) {
-                    selectedDevices.remove(device.hwid);
-                    selectedDevices.add(device.hwid);
+                    selectedDevices.remove(device.recordId);
+                    selectedDevices.add(device.recordId);
                   } else {
-                    selectedDevices.remove(device.hwid);
+                    selectedDevices.remove(device.recordId);
                   }
                 },
               )),
               DataCell(Text(device.platform)),
               DataCell(Text(device.id)),
               DataCell(Text(device.name)),
-              DataCell(Text(device.daysRemaining())),
+              DataCell(Row(mainAxisSize: MainAxisSize.min, children: [
+                Text(device.daysRemaining()),
+                if (device.expiresAt != 0)
+                  IconButton(
+                    icon: Icon(Icons.refresh),
+                    tooltip: translate('Renew trust'),
+                    onPressed: () =>
+                        renewTrustedDevice(device, devices, selectedDevices),
+                  ),
+              ])),
             ]);
           }).toList(),
         )),
